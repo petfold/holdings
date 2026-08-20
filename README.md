@@ -58,6 +58,12 @@ drive with confidence.
 
 ## Projection contract (OntoDAG integration)
 
+*(2026-08-20: this contract's canonical statement now lives at the meet
+point — [ontodag `docs/plans/PROJECTIONS.md`](https://github.com/petfold/ontodag/blob/main/docs/plans/PROJECTIONS.md)
+— which generalizes it across sources (files here, messages in ucomm)
+and adds retention classes. The rules below remain the agreed file-side
+instance and the wire format is unchanged.)*
+
 ```bash
 ./datacat.py project-ontodag --out placement.jsonl
 ```
