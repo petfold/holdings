@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-datacat — a disposable, regenerable catalog of where your files are.
+holdings — a disposable, regenerable catalog of where your files are.
 
 Design principles (see the accompanying README):
   * Observer, not authority: reads filesystems and backup listings,
@@ -33,8 +33,8 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 DEFAULT_DB = os.environ.get(
-    "DATACAT_DB",
-    os.path.join(os.path.expanduser("~"), ".local", "share", "datacat",
+    "HOLDINGS_DB",
+    os.path.join(os.path.expanduser("~"), ".local", "share", "holdings",
                  "catalog.sqlite"),
 )
 
@@ -157,7 +157,7 @@ def cmd_media(conn, args):
         "         WHERE i.medium_id=m.medium_id)"
         " FROM media m ORDER BY m.medium_id").fetchall()
     if not rows:
-        print("no media registered yet — use: datacat add-medium <id> --kind drive")
+        print("no media registered yet — use: holdings add-medium <id> --kind drive")
         return
     print(f"{'MEDIUM':22} {'KIND':12} {'BK':3} {'FILES':>8} {'SIZE':>10}"
           f" {'LAST SCAN':19}  LOCATION")
@@ -264,9 +264,9 @@ def cmd_import_restic(conn, args):
     """Ingest `restic ls --json <snapshot>` output so backup copies count.
 
     Usage:
-      restic -r <repo> ls --json latest | datacat import-restic restic-b2 -
+      restic -r <repo> ls --json latest | holdings import-restic restic-b2 -
     or with a saved file:
-      datacat import-restic restic-b2 listing.json
+      holdings import-restic restic-b2 listing.json
     """
     medium = conn.execute("SELECT medium_id FROM media WHERE medium_id=?",
                           (args.medium_id,)).fetchone()
@@ -293,7 +293,7 @@ def cmd_import_restic(conn, args):
             # restic ls --json does not expose content hashes; identity is
             # matched by (size, name) against known content when unique,
             # otherwise recorded as unverified. For exact matching, scan the
-            # restored/mounted repo (restic mount) with `datacat scan`.
+            # restored/mounted repo (restic mount) with `holdings scan`.
             h = match_known_content(conn, path, size)
             if h is None:
                 h = f"unverified:restic:{args.medium_id}:{path}:{size}"
@@ -315,7 +315,7 @@ def cmd_import_restic(conn, args):
     conn.commit()
     print(f"imported {count} entries into '{args.medium_id}'"
           f" (exact hashes where filename+size uniquely matched known content;"
-          f" run `restic mount` + `datacat scan` for exact verification)")
+          f" run `restic mount` + `holdings scan` for exact verification)")
 
 
 def match_known_content(conn, path: str, size: int):
@@ -510,7 +510,7 @@ def human_size(n) -> str:
 
 def main(argv=None):
     p = argparse.ArgumentParser(
-        prog="datacat",
+        prog="holdings",
         description="Catalog of which media hold which files."
                     " Placement truth in SQLite; semantics belong to OntoDAG.")
     p.add_argument("--db", default=DEFAULT_DB,

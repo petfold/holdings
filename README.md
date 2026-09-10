@@ -1,4 +1,4 @@
-# datacat — v0.1 of the placement catalog
+# holdings — v0.1 of the placement catalog
 
 A disposable, regenerable catalog answering: **which media hold which files?**
 Single file, stdlib only, Python 3.9+. SQLite for placement truth; semantics
@@ -6,12 +6,12 @@ belong to OntoDAG (see *Projection contract* below).
 
 ## Design contract (the important part)
 
-1. **Observer, not authority.** datacat only *reads* filesystems and backup
+1. **Observer, not authority.** holdings only *reads* filesystems and backup
    listings. It never writes to your data, never sits in the backup or sync
-   path. Deleting datacat and its database costs nothing but convenience.
+   path. Deleting holdings and its database costs nothing but convenience.
 2. **Everything is regenerable by re-scanning.** The catalog is a cache of
    facts about the world. The only original data in the whole system is your
-   *human* OntoDAG categorization — which datacat never touches.
+   *human* OntoDAG categorization — which holdings never touches.
 3. **Content hash is identity.** `sha256:…` is the primary key everywhere.
    Paths, media, snapshots, categories: all attributes of a hash.
 4. **Single writer, many readers.** Scan on the backup-node laptop. Put the
@@ -21,34 +21,34 @@ belong to OntoDAG (see *Projection contract* below).
 ## Quick start
 
 ```bash
-export DATACAT_DB=~/Sync/catalog/catalog.sqlite   # put it in a synced folder
+export HOLDINGS_DB=~/Sync/catalog/catalog.sqlite   # put it in a synced folder
 
 # Register your media once:
-./datacat.py add-medium laptop-x1       --kind laptop --location "with me"
-./datacat.py add-medium drive-budapest  --kind drive --backup --location "safe, Budapest"
-./datacat.py add-medium drive-standrews --kind drive --backup --location "office, St Andrews"
-./datacat.py add-medium restic-b2       --kind restic-repo --backup
+./holdings.py add-medium laptop-x1       --kind laptop --location "with me"
+./holdings.py add-medium drive-budapest  --kind drive --backup --location "safe, Budapest"
+./holdings.py add-medium drive-standrews --kind drive --backup --location "office, St Andrews"
+./holdings.py add-medium restic-b2       --kind restic-repo --backup
 
 # Scan whenever a medium is mounted (fast on rescan: unchanged files
 # are recognized by size+mtime and not rehashed):
-./datacat.py scan drive-budapest /media/peter/backup-drive
-./datacat.py scan laptop-x1 /home/peter --exclude-file ~/backup/excludes.txt
+./holdings.py scan drive-budapest /media/peter/backup-drive
+./holdings.py scan laptop-x1 /home/peter --exclude-file ~/backup/excludes.txt
 
 # Count backup snapshots as copies (approximate matching by name+size;
 # for exact hashes, `restic mount` the repo and `scan` it instead):
-restic -r b2:bucket:repo ls --json latest | ./datacat.py import-restic restic-b2 -
+restic -r b2:bucket:repo ls --json latest | ./holdings.py import-restic restic-b2 -
 ```
 
 ## Queries
 
 ```bash
-./datacat.py whereis holiday.jpg        # every medium+path holding this content
-./datacat.py whereis sha256:45887c...   # by hash
-./datacat.py redundancy --min-copies 2  # content below 2 backup copies
-./datacat.py only-on drive-budapest     # DANGER LIST: exists nowhere else
-./datacat.py diff drive-a drive-b       # on A but not B
-./datacat.py media                      # media overview
-./datacat.py stats                      # totals
+./holdings.py whereis holiday.jpg        # every medium+path holding this content
+./holdings.py whereis sha256:45887c...   # by hash
+./holdings.py redundancy --min-copies 2  # content below 2 backup copies
+./holdings.py only-on drive-budapest     # DANGER LIST: exists nowhere else
+./holdings.py diff drive-a drive-b       # on A but not B
+./holdings.py media                      # media overview
+./holdings.py stats                      # totals
 ```
 
 `redundancy` turns your 3-2-1 policy into a checkable report.
@@ -65,7 +65,7 @@ and adds retention classes. The rules below remain the agreed file-side
 instance and the wire format is unchanged.)*
 
 ```bash
-./datacat.py project-ontodag --out placement.jsonl
+./holdings.py project-ontodag --out placement.jsonl
 ```
 
 Emits JSON lines: `{"item": "<hash>", "supercategories": ["sys:on:<medium>",

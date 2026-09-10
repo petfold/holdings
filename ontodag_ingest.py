@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ontodag_ingest.py — adaptation template for ingesting datacat's placement
+ontodag_ingest.py — adaptation template for ingesting holdings's placement
 projection into an OntoDAG instance.
 
 This is a TEMPLATE: adapt the three marked functions to OntoDAG's actual API
@@ -13,7 +13,7 @@ This is a TEMPLATE: adapt the three marked functions to OntoDAG's actual API
   3. Items are identified by content hash — the join key with SQLite.
 
 Usage:
-    ./datacat.py project-ontodag | python3 ontodag_ingest.py mydag.pkl
+    ./holdings.py project-ontodag | python3 ontodag_ingest.py mydag.pkl
 """
 
 import json

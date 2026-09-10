@@ -1,0 +1,27 @@
+[project]
+name = "holdings"
+version = "0.1.0"
+description = "Disposable, regenerable catalog of which media hold which files"
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.9"
+authors = [{ name = "Peter Foldiak" }]
+keywords = ["backup", "catalog", "placement", "redundancy", "sqlite", "content-addressed", "ontodag"]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/petfold/holdings"
+Issues = "https://github.com/petfold/holdings/issues"
+
+[project.scripts]
+holdings = "holdings:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["holdings"]
