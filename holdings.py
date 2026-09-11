@@ -324,9 +324,9 @@ def match_known_content(conn, path: str, size: int):
     base = os.path.basename(path)
     rows = conn.execute(
         "SELECT DISTINCT i.hash FROM instances i"
-        " WHERE i.size=? AND (i.path=? OR i.path LIKE ?)"
+        " WHERE i.size=? AND (i.path=? OR i.path=? OR i.path LIKE ?)"
         "   AND i.hash LIKE 'sha256:%' LIMIT 2",
-        (size, path, "%/" + base)).fetchall()
+        (size, path, base, "%/" + base)).fetchall()
     if len(rows) == 1:
         return rows[0][0]
     return None
@@ -473,7 +473,8 @@ def cmd_project_ontodag(conn, args):
         from this stream (idempotent full rebuild, no incremental diffing);
       * human categories are never touched by this stream.
     """
-    out = sys.stdout if args.out == "-" else open(args.out, "w")
+    to_stdout = args.out == "-"
+    out = sys.stdout if to_stdout else open(args.out, "w")
     rows = conn.execute(
         "SELECT c.hash,"
         "  (SELECT GROUP_CONCAT(DISTINCT i.medium_id) FROM instances i"
@@ -484,7 +485,7 @@ def cmd_project_ontodag(conn, args):
         "  (SELECT i3.path FROM instances i3 WHERE i3.hash=c.hash LIMIT 1)"
         " FROM content c").fetchall()
     n = 0
-    with out:
+    try:
         for h, media_csv, bcopies, path in rows:
             supers = [f"sys:on:{m}" for m in (media_csv or "").split(",") if m]
             ext = os.path.splitext(path or "")[1].lstrip(".").lower()
@@ -493,6 +494,10 @@ def cmd_project_ontodag(conn, args):
             supers.append(f"sys:backup:{bcopies}")
             out.write(json.dumps({"item": h, "supercategories": supers}) + "\n")
             n += 1
+    finally:
+        out.flush()
+        if not to_stdout:          # never close the caller's stdout
+            out.close()
     print(f"projected {n} items", file=sys.stderr)
 
 

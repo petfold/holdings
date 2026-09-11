@@ -1,7 +1,7 @@
 # holdings — v0.1 of the placement catalog
 
 A disposable, regenerable catalog answering: **which media hold which files?**
-Single file, stdlib only, Python 3.9+. SQLite for placement truth; semantics
+Single file, stdlib only, Python 3.10+. SQLite for placement truth; semantics
 belong to OntoDAG (see *Projection contract* below).
 
 ## Design contract (the important part)
@@ -97,5 +97,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
+* Tests: `pip install -e ".[test]" && pytest` — **46 tests**, stdlib only, no
+  node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.
