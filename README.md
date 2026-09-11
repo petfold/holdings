@@ -97,6 +97,5 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Roadmap (from the discussion): v0.2 Syncthing REST adapter; v0.3 OntoDAG
-  join live; v0.4 FastAPI localhost UI; v0.5 WASM/PWA read-only viewer for
-  phones off the synced SQLite.
+* Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
+  limits above are meant to change.
