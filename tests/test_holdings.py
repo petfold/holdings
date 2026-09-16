@@ -724,14 +724,25 @@ def test_whereis_by_bare_filename_uses_the_name_index(db, run, tmp_path):
     It used to be `path LIKE '%/name'`, which a leading wildcard makes
     unservable by any index: measured at 8 minutes unfinished over the
     network on a 125 MB catalog.
+
+    Asserted at a size where the index is genuinely the cheaper plan. On a
+    handful of rows a scan is cheaper and SQLite rightly picks one, so a
+    plan assertion on a tiny catalog would be testing the planner's
+    arithmetic rather than this schema.
     """
     write(tmp_path / "disk" / "deep" / "holiday.jpg", "photo")
     run("add-medium", "d", "--kind", "drive")
     run("scan", "d", str(tmp_path / "disk"))
     with sqlite3.connect(db) as c:
+        c.executemany(
+            "INSERT INTO instances"
+            " (medium_id, path, name, hash, size, seen_at)"
+            " VALUES ('d', ?, ?, 'sha256:aa', 1, 0)",
+            [(f"bulk/{i}/f{i}.txt", f"f{i}.txt") for i in range(2000)])
+        c.execute("ANALYZE")
         plan = c.execute("EXPLAIN QUERY PLAN SELECT DISTINCT hash FROM"
                          " instances WHERE name=? LIMIT 2", ("x",)).fetchall()
-    assert "idx_instances_name" in plan[0][-1]
+    assert "idx_instances_name" in plan[0][-1], plan
 
 
 def test_same_name_same_content_is_not_ambiguous(run, capsys, tmp_path):
@@ -880,3 +891,136 @@ def test_import_restic_also_keeps_derived_state_consistent(db, run, tmp_path,
         assert names == {"report.pdf", "top.txt"}
     finally:
         conn.close()
+
+
+# --------------------------------------------- materialised copy counts
+
+def test_flipping_backup_on_a_medium_updates_every_copy_count(run, db, capsys,
+                                                              tmp_path):
+    """The reason refresh runs after add-medium and not only after scan:
+    one flag on one medium changes backup_copies for everything on it."""
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")          # not a backup yet
+    run("scan", "d", str(tmp_path / "disk"))
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT backup_copies FROM content").fetchone()[0] == 0
+
+    run("add-medium", "d", "--kind", "drive", "--backup")
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT backup_copies FROM content").fetchone()[0] == 1
+    capsys.readouterr()
+    run("redundancy", "--min-copies", "1")
+    assert "OK" in capsys.readouterr().out
+
+
+def test_re_adding_a_medium_does_not_lose_its_totals(run, db, tmp_path,
+                                                     capsys):
+    """add-medium is INSERT OR REPLACE, which blanks the derived columns on
+    the row; the refresh afterwards has to put them back."""
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    run("add-medium", "d", "--kind", "drive", "--location", "moved house")
+    capsys.readouterr()
+    run("media")
+    out = capsys.readouterr().out
+    assert "moved house" in out
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT file_count FROM media").fetchone()[0] == 1
+        assert holdings.derived_drift(c) == []
+
+
+def test_only_on_still_finds_content_held_nowhere_else(run, capsys, tmp_path):
+    """Behaviour pinned across the rewrite onto content.copies."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    write(a / "shared.txt", "shared")
+    write(b / "shared.txt", "shared")
+    write(a / "only-here.txt", "unique")
+    run("add-medium", "a", "--kind", "drive")
+    run("add-medium", "b", "--kind", "drive")
+    run("scan", "a", str(a))
+    run("scan", "b", str(b))
+    capsys.readouterr()
+    run("only-on", "a")
+    out = capsys.readouterr().out
+    assert "only-here.txt" in out and "shared.txt" not in out
+    assert out.startswith("1 files")
+
+
+def test_stale_copy_counts_are_reported_not_trusted(run, db, tmp_path,
+                                                    capsys):
+    """The dangerous direction: stored counts claiming backups that the base
+    tables do not support."""
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE content SET backup_copies=3, copies=3")
+    with pytest.raises(SystemExit):
+        run("check")
+    assert "stale" in capsys.readouterr().err
+
+
+def test_an_old_catalog_gets_counts_not_silent_zeroes(tmp_path, capsys):
+    """Migration must refresh, not just add columns.
+
+    A NOT NULL DEFAULT 0 column reads as "no backup copies anywhere", which
+    would make `redundancy` denounce a perfectly backed-up catalog — and
+    `only-on` is the list people wipe drives from.
+    """
+    db = str(tmp_path / "old.sqlite")
+    old = sqlite3.connect(db)
+    old.executescript(OLD_INSTANCES)
+    old.execute("INSERT INTO media (medium_id, kind, is_backup)"
+                " VALUES ('drive-budapest','drive',1)")
+    old.execute("INSERT INTO content VALUES ('sha256:aa', 10, 0)")
+    old.execute("INSERT INTO instances (medium_id, path, hash, size, seen_at)"
+                " VALUES ('drive-budapest','holiday.jpg','sha256:aa',10,0)")
+    old.commit()
+    old.close()
+
+    conn = holdings.db_connect(db)
+    try:
+        assert conn.execute(
+            "SELECT copies, backup_copies, example_path FROM content"
+        ).fetchone() == (1, 1, "holiday.jpg")
+        assert holdings.derived_drift(conn) == []
+    finally:
+        conn.close()
+
+    holdings.main(["--db", db, "redundancy", "--min-copies", "1"])
+    assert "OK" in capsys.readouterr().out
+
+
+def test_only_here_flag_follows_content_becoming_redundant(run, db, capsys,
+                                                           tmp_path):
+    """`only-on` is the list people wipe drives from, so the flag that drives
+    it has to clear the moment a second copy appears."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    write(a / "precious.txt", "precious")
+    run("add-medium", "a", "--kind", "drive")
+    run("add-medium", "b", "--kind", "drive")
+    run("scan", "a", str(a))
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT only_here FROM instances").fetchone()[0] == 1
+
+    write(b / "precious.txt", "precious")        # now held twice
+    run("scan", "b", str(b))
+    with sqlite3.connect(db) as c:
+        assert [r[0] for r in c.execute("SELECT only_here FROM instances")] \
+            == [0, 0]
+        assert holdings.derived_drift(c) == []
+    capsys.readouterr()
+    run("only-on", "a")
+    assert capsys.readouterr().out.startswith("0 files")
+
+
+def test_only_here_drift_is_detected(run, db, capsys, tmp_path):
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE instances SET only_here=0")   # hides the danger
+    with pytest.raises(SystemExit):
+        run("check")
+    assert "only_here" in capsys.readouterr().err

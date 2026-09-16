@@ -47,13 +47,41 @@ CREATE TABLE IF NOT EXISTS media (
     location_hint TEXT,                      -- e.g. 'safe, Budapest flat'
     is_backup     INTEGER NOT NULL DEFAULT 0,-- counts toward redundancy as a backup copy
     notes         TEXT,
-    last_scanned  REAL
+    last_scanned  REAL,
+    file_count      INTEGER NOT NULL DEFAULT 0, -- derived from instances
+    byte_count      INTEGER NOT NULL DEFAULT 0,
+    only_here_count INTEGER NOT NULL DEFAULT 0, -- content held nowhere else
+    only_here_bytes INTEGER NOT NULL DEFAULT 0
+);
+
+-- How many content objects sit at each backup-copy count. `redundancy`
+-- needs a total for a threshold given at runtime, which no single stored
+-- number can answer -- but backup_copies takes very few distinct values,
+-- so summing this table reads a handful of rows instead of counting
+-- tens of thousands.
+CREATE TABLE IF NOT EXISTS backup_histogram (
+    backup_copies INTEGER PRIMARY KEY,
+    content_count INTEGER NOT NULL
+);
+
+-- One row (id=1) of totals that `stats` would otherwise scan the whole
+-- catalog to produce.
+CREATE TABLE IF NOT EXISTS catalog_summary (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    content_count  INTEGER NOT NULL DEFAULT 0,
+    content_bytes  INTEGER NOT NULL DEFAULT 0,
+    instance_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS content (
     hash       TEXT PRIMARY KEY,             -- 'sha256:...'
     size       INTEGER NOT NULL,
-    first_seen REAL NOT NULL
+    first_seen REAL NOT NULL,
+    -- Derived from instances+media, refreshed after every write. Added by
+    -- ALTER TABLE on older catalogs, so they stay last (see instances.name).
+    copies        INTEGER NOT NULL DEFAULT 0,-- distinct media holding it
+    backup_copies INTEGER NOT NULL DEFAULT 0,-- distinct *backup* media
+    example_path  TEXT                       -- lowest path, for reports
 );
 
 CREATE TABLE IF NOT EXISTS instances (
@@ -67,6 +95,7 @@ CREATE TABLE IF NOT EXISTS instances (
     -- Added by ALTER TABLE on older catalogs, so it must stay last here:
     -- fresh and migrated databases then agree on column order.
     name      TEXT,                          -- basename of path
+    only_here INTEGER NOT NULL DEFAULT 0,    -- its content is on no other medium
     PRIMARY KEY (medium_id, path)
 );
 
@@ -95,6 +124,21 @@ CREATE INDEX IF NOT EXISTS idx_instances_path ON instances(path);
 -- And `whereis <bare filename>` searches the basename, which no index can
 -- serve from `path` (the pattern starts with a wildcard), hence `name`.
 CREATE INDEX IF NOT EXISTS idx_instances_name ON instances(name);
+-- `redundancy` reads content in (backup_copies, size) order and stops at
+-- --limit, so the index supplies both the filter and the ordering.
+CREATE INDEX IF NOT EXISTS idx_content_redundancy
+    ON content(backup_copies, size DESC);
+-- `only-on` is the danger list, so it has to be usable. Driving it from
+-- the singletons (copies=1) in size order and probing instances by hash
+-- costs the size of that set; driving it from the medium's rows costs the
+-- whole medium, which measured at minutes over a network.
+CREATE INDEX IF NOT EXISTS idx_content_singletons
+    ON content(copies, size DESC);
+-- `only-on` wants one medium's singletons, largest first. Carrying the
+-- flag on the instance row lets one index range scan answer that, instead
+-- of walking every singleton in the catalog and probing for its medium.
+CREATE INDEX IF NOT EXISTS idx_instances_only_here
+    ON instances(medium_id, only_here, size DESC);
 """
 
 
@@ -113,15 +157,34 @@ def migrate(conn: sqlite3.Connection) -> None:
     demand, and dropping the file would lose exactly the part that cannot be
     rebuilt. Migrations here are additive and idempotent.
     """
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(instances)")}
-    if "name" not in cols:
-        conn.execute("ALTER TABLE instances ADD COLUMN name TEXT")
+    added = False
+    for table, column, decl in [
+        ("instances", "name", "TEXT"),
+        ("instances", "only_here", "INTEGER NOT NULL DEFAULT 0"),
+        ("media", "only_here_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("media", "only_here_bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ("content", "copies", "INTEGER NOT NULL DEFAULT 0"),
+        ("content", "backup_copies", "INTEGER NOT NULL DEFAULT 0"),
+        ("content", "example_path", "TEXT"),
+        ("media", "file_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("media", "byte_count", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            added = True
+
     stale = conn.execute(
         "SELECT medium_id, path FROM instances WHERE name IS NULL").fetchall()
     if stale:
         conn.executemany(
             "UPDATE instances SET name=? WHERE medium_id=? AND path=?",
             [(basename(path), mid, path) for mid, path in stale])
+    if added:
+        # The counts default to 0, which would read as "no backups anywhere"
+        # until something refreshed them -- so refresh before anyone can ask.
+        refresh_derived(conn)
+    if stale or added:
         conn.commit()
 
 
@@ -275,6 +338,90 @@ def is_excluded(rel_path: str, name: str, patterns: list[str]) -> bool:
 # someone wiping a drive. So the recomputation stays available, the writers
 # refresh it, and a test asserts the two agree.
 
+# One grouped pass over instances: what every content row's derived columns
+# should be. MIN(path) rather than an arbitrary one, so the value is
+# reproducible and drift is therefore detectable.
+_GROUPED = """
+SELECT i.hash AS hash,
+       COUNT(DISTINCT i.medium_id) AS copies,
+       COUNT(DISTINCT CASE WHEN m.is_backup THEN i.medium_id END)
+           AS backup_copies,
+       MIN(i.path) AS example_path
+  FROM instances i JOIN media m ON m.medium_id = i.medium_id
+ GROUP BY i.hash
+"""
+
+_RECOMPUTE = f"""
+SELECT c.hash, COALESCE(x.copies, 0), COALESCE(x.backup_copies, 0),
+       x.example_path
+  FROM content c LEFT JOIN ({_GROUPED}) x ON x.hash = c.hash
+"""
+
+
+def refresh_derived(conn) -> None:
+    """Recompute every derived column from the base tables.
+
+    Wholesale, not incrementally -- the same choice the projection contract
+    makes, and for the same reason: staleness is a permitted failure mode,
+    drift is not, and a full rebuild cannot half-apply. It runs after each
+    write command, which is rare (a scan already walked a filesystem), so
+    the cost lands where nobody is waiting on a query.
+
+    It must run after `add-medium` too, not just after a scan: flipping
+    --backup on one medium changes backup_copies for everything on it.
+    """
+    # Staged through a temp table rather than UPDATE..FROM, which needs
+    # SQLite 3.33 -- newer than `requires-python = ">=3.10"` guarantees.
+    conn.execute("DROP TABLE IF EXISTS temp._counts")
+    conn.execute(f"CREATE TEMP TABLE _counts AS {_GROUPED}")
+    conn.execute("CREATE INDEX temp._counts_hash ON _counts(hash)")
+    conn.execute(
+        "UPDATE content SET"
+        "  copies = COALESCE("
+        "    (SELECT copies FROM _counts WHERE hash = content.hash), 0),"
+        "  backup_copies = COALESCE("
+        "    (SELECT backup_copies FROM _counts WHERE hash = content.hash), 0),"
+        "  example_path ="
+        "    (SELECT example_path FROM _counts WHERE hash = content.hash)")
+    conn.execute("DROP TABLE temp._counts")
+    conn.execute(
+        "UPDATE instances SET only_here = COALESCE("
+        "  (SELECT c.copies = 1 FROM content c WHERE c.hash = instances.hash),"
+        "  0)")
+    # After content.copies, which only_here_* depends on.
+    conn.execute(
+        "UPDATE media SET"
+        "  file_count = (SELECT COUNT(*) FROM instances"
+        "                 WHERE medium_id = media.medium_id),"
+        "  byte_count = COALESCE((SELECT SUM(size) FROM instances"
+        "                          WHERE medium_id = media.medium_id), 0),"
+        "  only_here_count = (SELECT COUNT(*) FROM instances i"
+        "     JOIN content c ON c.hash = i.hash"
+        "    WHERE i.medium_id = media.medium_id AND c.copies = 1),"
+        "  only_here_bytes = COALESCE((SELECT SUM(c.size) FROM instances i"
+        "     JOIN content c ON c.hash = i.hash"
+        "    WHERE i.medium_id = media.medium_id AND c.copies = 1), 0)")
+    conn.execute("DELETE FROM backup_histogram")
+    conn.execute(
+        "INSERT INTO backup_histogram (backup_copies, content_count)"
+        " SELECT backup_copies, COUNT(*) FROM content GROUP BY backup_copies")
+    # Query plans here are genuinely data-dependent -- whether `only-on` is
+    # better driven from the singleton set or from the medium depends on
+    # their relative sizes -- so give the planner current statistics rather
+    # than forcing a join order that is right for one shape of catalog.
+    conn.execute("ANALYZE")
+    conn.execute(
+        "INSERT INTO catalog_summary (id, content_count, content_bytes,"
+        "                             instance_count)"
+        " VALUES (1, (SELECT COUNT(*) FROM content),"
+        "            (SELECT COALESCE(SUM(size), 0) FROM content),"
+        "            (SELECT COUNT(*) FROM instances))"
+        " ON CONFLICT(id) DO UPDATE SET"
+        "   content_count=excluded.content_count,"
+        "   content_bytes=excluded.content_bytes,"
+        "   instance_count=excluded.instance_count")
+
+
 def derived_drift(conn) -> list[str]:
     """Describe every disagreement between stored derived state and a fresh
     recomputation from the base tables. Empty list means consistent."""
@@ -286,6 +433,56 @@ def derived_drift(conn) -> list[str]:
         problems.append(
             f"instances.name disagrees with path on {len(wrong)} row(s), "
             f"e.g. {wrong[0]!r}")
+
+    flags = conn.execute(
+        "SELECT COUNT(*) FROM instances i LEFT JOIN content c"
+        "    ON c.hash = i.hash"
+        " WHERE i.only_here <> COALESCE(c.copies = 1, 0)").fetchone()[0]
+    if flags:
+        problems.append(
+            f"instances.only_here disagrees with content.copies"
+            f" on {flags} row(s)")
+
+    expected = {h: row for h, *row in conn.execute(_RECOMPUTE)}
+    stored = {h: row for h, *row in conn.execute(
+        "SELECT hash, copies, backup_copies, example_path FROM content")}
+    off = [h for h in stored if stored[h] != expected.get(h)]
+    if off:
+        problems.append(
+            f"content copy counts are stale on {len(off)} row(s), "
+            f"e.g. {off[0]}: stored {stored[off[0]]}, "
+            f"recomputed {expected.get(off[0])}")
+
+    for mid, *stored_totals in conn.execute(
+            "SELECT medium_id, file_count, byte_count, only_here_count,"
+            "       only_here_bytes FROM media"):
+        real = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(i.size), 0),"
+            "       COALESCE(SUM(c.copies = 1), 0),"
+            "       COALESCE(SUM(CASE WHEN c.copies = 1 THEN c.size END), 0)"
+            "  FROM instances i JOIN content c ON c.hash = i.hash"
+            " WHERE i.medium_id=?", (mid,)).fetchone()
+        if tuple(stored_totals) != tuple(real):
+            problems.append(f"media '{mid}' totals stale: stored "
+                            f"{tuple(stored_totals)}, recomputed {tuple(real)}")
+
+    hist = dict(conn.execute(
+        "SELECT backup_copies, content_count FROM backup_histogram"))
+    real_hist = dict(conn.execute(
+        "SELECT backup_copies, COUNT(*) FROM content GROUP BY backup_copies"))
+    if hist != real_hist:
+        problems.append(f"backup histogram stale: stored {hist},"
+                        f" recomputed {real_hist}")
+
+    row = conn.execute("SELECT content_count, content_bytes, instance_count"
+                       " FROM catalog_summary WHERE id=1").fetchone()
+    real = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM content),"
+        "       (SELECT COALESCE(SUM(size), 0) FROM content),"
+        "       (SELECT COUNT(*) FROM instances)").fetchone()
+    if row is None or tuple(row) != tuple(real):
+        problems.append(f"catalog summary stale: stored {row},"
+                        f" recomputed {tuple(real)}")
     return problems
 
 
@@ -313,6 +510,7 @@ def cmd_add_medium(conn, args):
         (args.medium_id, args.kind, args.location, int(args.backup),
          args.notes, args.medium_id),
     )
+    refresh_derived(conn)       # --backup here changes every backup_copies
     conn.commit()
     print(f"medium '{args.medium_id}' registered"
           f" (kind={args.kind}, backup={'yes' if args.backup else 'no'})")
@@ -320,12 +518,9 @@ def cmd_add_medium(conn, args):
 
 def cmd_media(conn, args):
     rows = conn.execute(
-        "SELECT m.medium_id, m.kind, m.is_backup, m.location_hint,"
-        "       m.last_scanned,"
-        "       (SELECT COUNT(*) FROM instances i WHERE i.medium_id=m.medium_id),"
-        "       (SELECT COALESCE(SUM(size),0) FROM instances i"
-        "         WHERE i.medium_id=m.medium_id)"
-        " FROM media m ORDER BY m.medium_id").fetchall()
+        "SELECT medium_id, kind, is_backup, location_hint, last_scanned,"
+        "       file_count, byte_count"
+        " FROM media ORDER BY medium_id").fetchall()
     if not rows:
         print("no media registered yet — use: holdings add-medium <id> --kind drive")
         return
@@ -425,6 +620,7 @@ def cmd_scan(conn, args):
         "UPDATE scans SET finished=?, files_seen=?, bytes_seen=?, hashed=?"
         " WHERE scan_id=?",
         (time.time(), files_seen, bytes_seen, hashed, scan_id))
+    refresh_derived(conn)
     conn.commit()
     print(f"scan of '{args.medium_id}' complete: {files_seen} files"
           f" ({human_size(bytes_seen)}), {hashed} hashed,"
@@ -486,6 +682,7 @@ def cmd_import_restic(conn, args):
         (args.medium_id, started))
     conn.execute("UPDATE media SET last_scanned=? WHERE medium_id=?",
                  (time.time(), args.medium_id))
+    refresh_derived(conn)
     conn.commit()
     print(f"imported {count} entries into '{args.medium_id}'"
           f" (exact hashes where filename+size uniquely matched known content;"
@@ -553,29 +750,17 @@ def resolve_hash(conn, target: str):
 def cmd_redundancy(conn, args):
     """Content with fewer than --min-copies copies on *backup* media."""
     rows = conn.execute(
-        "SELECT * FROM ("
-        "  SELECT c.hash, c.size,"
-        "    (SELECT COUNT(DISTINCT i.medium_id) FROM instances i"
-        "      JOIN media m ON m.medium_id=i.medium_id"
-        "      WHERE i.hash=c.hash AND m.is_backup=1) AS bcopies,"
-        "    (SELECT COUNT(DISTINCT i2.medium_id) FROM instances i2"
-        "      WHERE i2.hash=c.hash) AS copies,"
-        "    (SELECT i3.path FROM instances i3 WHERE i3.hash=c.hash LIMIT 1)"
-        "      AS example_path"
-        "  FROM content c"
-        ") WHERE bcopies < ?"
-        " ORDER BY bcopies, size DESC LIMIT ?",
+        "SELECT hash, size, backup_copies, copies, example_path FROM content"
+        " WHERE backup_copies < ?"
+        " ORDER BY backup_copies, size DESC LIMIT ?",
         (args.min_copies, args.limit)).fetchall()
     if not rows:
         print(f"OK: everything has at least {args.min_copies}"
               f" backup cop{'y' if args.min_copies==1 else 'ies'}.")
         return
     total = conn.execute(
-        "SELECT COUNT(*) FROM content c WHERE"
-        "  (SELECT COUNT(DISTINCT i.medium_id) FROM instances i"
-        "    JOIN media m ON m.medium_id=i.medium_id"
-        "    WHERE i.hash=c.hash AND m.is_backup=1) < ?",
-        (args.min_copies,)).fetchone()[0]
+        "SELECT COALESCE(SUM(content_count), 0) FROM backup_histogram"
+        " WHERE backup_copies < ?", (args.min_copies,)).fetchone()[0]
     print(f"{total} content objects below {args.min_copies} backup copies"
           f" (showing up to {args.limit}, largest first):")
     print(f"{'BK':>2} {'ALL':>3} {'SIZE':>10}  EXAMPLE PATH")
@@ -604,20 +789,17 @@ def cmd_diff(conn, args):
 
 def cmd_only_on(conn, args):
     """Content whose ONLY copies are on the given medium — the danger list."""
+    # copies=1 means exactly one medium holds it; combined with an instance
+    # on this medium, that medium is this one. Driven from content so the
+    # cost is the size of the singleton set, not the size of the medium.
     rows = conn.execute(
-        "SELECT i.path, c.size FROM instances i JOIN content c ON c.hash=i.hash"
-        " WHERE i.medium_id=? AND NOT EXISTS"
-        "   (SELECT 1 FROM instances i2 WHERE i2.hash=i.hash"
-        "     AND i2.medium_id<>?)"
-        " ORDER BY c.size DESC LIMIT ?",
-        (args.medium_id, args.medium_id, args.limit)).fetchall()
+        "SELECT path, size FROM instances"
+        " WHERE medium_id=? AND only_here=1"
+        " ORDER BY size DESC LIMIT ?",
+        (args.medium_id, args.limit)).fetchall()
     total, tbytes = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(c.size),0) FROM instances i"
-        " JOIN content c ON c.hash=i.hash"
-        " WHERE i.medium_id=? AND NOT EXISTS"
-        "   (SELECT 1 FROM instances i2 WHERE i2.hash=i.hash"
-        "     AND i2.medium_id<>?)",
-        (args.medium_id, args.medium_id)).fetchone()
+        "SELECT only_here_count, only_here_bytes FROM media WHERE medium_id=?",
+        (args.medium_id,)).fetchone() or (0, 0)
     print(f"{total} files ({human_size(tbytes)}) exist ONLY on"
           f" '{args.medium_id}':")
     for path, size in rows:
@@ -625,9 +807,10 @@ def cmd_only_on(conn, args):
 
 
 def cmd_stats(conn, args):
-    n_content, t_bytes = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(size),0) FROM content").fetchone()
-    n_inst = conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
+    row = conn.execute(
+        "SELECT content_count, content_bytes, instance_count"
+        " FROM catalog_summary WHERE id=1").fetchone()
+    n_content, t_bytes, n_inst = row or (0, 0, 0)
     n_media = conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]
     dup = n_inst - n_content if n_content else 0
     print(f"media: {n_media}   unique content: {n_content}"
@@ -649,15 +832,12 @@ def cmd_project_ontodag(conn, args):
     """
     to_stdout = args.out == "-"
     out = sys.stdout if to_stdout else open(args.out, "w")
+    # One grouped pass for the medium list; the rest is already materialised.
     rows = conn.execute(
-        "SELECT c.hash,"
-        "  (SELECT GROUP_CONCAT(DISTINCT i.medium_id) FROM instances i"
-        "    WHERE i.hash=c.hash),"
-        "  (SELECT COUNT(DISTINCT i2.medium_id) FROM instances i2"
-        "    JOIN media m ON m.medium_id=i2.medium_id"
-        "    WHERE i2.hash=c.hash AND m.is_backup=1),"
-        "  (SELECT i3.path FROM instances i3 WHERE i3.hash=c.hash LIMIT 1)"
-        " FROM content c").fetchall()
+        "SELECT c.hash, GROUP_CONCAT(DISTINCT i.medium_id),"
+        "       c.backup_copies, c.example_path"
+        " FROM content c LEFT JOIN instances i ON i.hash=c.hash"
+        " GROUP BY c.hash, c.backup_copies, c.example_path").fetchall()
     n = 0
     try:
         for h, media_csv, bcopies, path in rows:

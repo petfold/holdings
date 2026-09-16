@@ -83,14 +83,23 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
       (0.06%), by bare filename 23 pages (0.07%).
       Cost: the column and its index add ~12% to the catalog on disk, and
       backfilling 300k rows took 16s once.
-- [ ] **Materialise the backup-copy count on `content`**, refreshed at scan
-      time, so `redundancy` and `only-on` become index range scans rather
-      than full scans with correlated subqueries. Measured: `redundancy`,
-      `only-on`, `stats` and `media` all failed to finish in 8 minutes over
-      the network on the catalog above. **Worth doing whatever happens to
-      this track** — it speeds the same reports up locally — but it is also
-      what decides whether a published catalog is useful for anything beyond
-      a point lookup.
+- [x] **The reports read materialised state instead of scanning**
+      (DONE 2026-09-16). `content.copies` / `.backup_copies` /
+      `.example_path`, `instances.only_here`, per-medium totals on `media`,
+      a one-row `catalog_summary` and a `backup_histogram` for the
+      runtime-threshold count — all recomputed wholesale after every write
+      command (including `add-medium`, since one `--backup` flag changes
+      every count), with `ANALYZE` so the planner has current statistics.
+      Measured on a live node, 157 MB published catalog, whole command,
+      cold: `stats` 4 pages, `media` 4, `redundancy` 56, `only-on` 71 —
+      all four of which previously failed to finish in 8 minutes.
+      Cost: the derived columns and their indexes grew the catalog from
+      113 MB to 157 MB (+39%), and refresh adds a few seconds to a scan.
+- [ ] **`diff A B` is the one report still proportional to its input.** It
+      asks "does B hold this too?" once per file on A, which no
+      precomputation removes. Acceptable locally; expensive over a network.
+      If it ever matters, it wants a per-pair summary rather than a better
+      index.
 - [ ] **Warn on a stale published catalog.** `swarmlite publish` checkpoints
       WAL into the artifact, so `bzz://` and `bzzf://` are always whole; but
       a `file://` read of a live catalog silently skips an un-checkpointed

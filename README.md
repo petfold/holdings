@@ -94,21 +94,24 @@ Two things this deliberately is not:
   `scan` and `import-restic` refuse a URL and point back at the local file.
   Single-writer is the design contract, not a limitation of the transport.
 
-Worth knowing before leaning on it. Measured against a live Bee node on a
-130 MB published catalog (120k files, 300k placements) — whole command,
-cold cache each time:
+Measured against a live Bee node on a 157 MB published catalog (120k files,
+300k placements) — whole command, cold cache each time:
 
-| query | pages fetched | of the file | time |
-|---|---|---|---|
-| `whereis sha256:…` | 17 | 0.05% | 14.6s |
-| `whereis <full path>` | 20 | 0.06% | 11.0s |
-| `whereis <bare filename>` | 23 | 0.07% | 1.8s |
-| `redundancy`, `only-on`, `stats`, `media` | — | did not finish in 8 min | |
+| command | pages fetched | of the file |
+|---|---|---|
+| `stats` | 4 | 0.01% |
+| `media` | 4 | 0.01% |
+| `whereis sha256:…` | 17 | 0.05% |
+| `whereis <bare filename>` | 23 | 0.06% |
+| `redundancy --min-copies 2` | 56 | 0.16% |
+| `only-on laptop-x1` | 71 | 0.20% |
 
-So lookups are what a published catalog is good for today — three orders of
-magnitude less than the file, on any of the three ways of naming a file. The
-reports are still full scans and remain a roadmap item
-([ROADMAP.md](ROADMAP.md)), worth fixing locally regardless of Swarm.
+Page counts are stable; wall-clock varies with the network (0.9s to 90s for
+the same query across runs), so pages are the honest measure.
+
+`diff A B` is the exception and stays proportional to what is on A — it has
+to ask "does B hold this too?" once per file, and no amount of precomputation
+removes that. Fine locally, expensive over a network.
 
 ## Projection contract (OntoDAG integration)
 
@@ -151,7 +154,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **74 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **81 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.
