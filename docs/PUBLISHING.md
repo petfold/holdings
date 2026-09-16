@@ -68,6 +68,21 @@ whole history; every line is still queryable.
 Use a bare `bzz://` pin when you want a specific version to stay answerable
 — before wiping a drive, say.
 
+## Erasure coding: what survives chunk loss
+
+Uploads use **redundancy level 2** by default — erasure coding, so the
+published root still resolves when some of its chunks cannot be retrieved.
+`web/publish.py` passes it explicitly rather than inheriting it, and
+`swarmlite publish` gets the same level from swarmfs's default.
+
+It is worth knowing the level exists, because it is the setting that decides
+whether a published catalog is readable after partial loss, and because it
+costs more stamped chunks — `--buy` sizing already accounts for that. Levels
+run 0–4; `web/publish.py --redundancy N` changes it.
+
+This is a property of the *upload*, not of the postage. A batch running out
+still takes everything with it, whatever the erasure level.
+
 ## Stamps, and the renewal that is now your job
 
 A published root lives exactly as long as its postage batch, and **an
