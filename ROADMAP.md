@@ -45,12 +45,30 @@ Goal: answer "which media hold which files?" from a single stdlib-only script.
 
 ## v0.4 — localhost UI
 
-- [ ] FastAPI localhost UI over the same database.
+- [ ] FastAPI localhost UI over the same database. Worth reconsidering now
+      that v0.5 exists: the browser viewer needs no server and reaches any
+      device, while this reaches only the machine it runs on. Its remaining
+      case is offline use against a local catalog, which the viewer cannot
+      do — reads happen over the network at query time.
 
 ## v0.5 — read-only viewer for phones
 
-- [ ] WASM/PWA read-only viewer, reading the synced SQLite file directly so a
-      phone needs no server.
+- [x] **Read-only viewer** (DONE 2026-09-16), in `web/`: media, `whereis`,
+      `redundancy` and `only-on` as a static page over SQLite-WASM, with
+      `web/publish.py` to assemble and publish it.
+
+      Done before v0.4 deliberately. The original wording was "reading the
+      synced SQLite file directly so a phone needs no server" — but a phone
+      does not need the file either. Reads go page by page over range
+      requests: opening the viewer on a 157 MB catalog fetches 5 pages
+      (0.014%), and the heaviest report 71 (0.200%), identical to the CLI's
+      counts. That only became true once the reports stopped scanning, which
+      is why this lands after that work rather than before it.
+
+      The SQL lives in `holdings.QUERIES`, is generated into
+      `web/queries.json`, and a test fails when the committed copy drifts —
+      a second hand-written copy of those queries would have gone stale the
+      day the aggregates moved to write time.
 
 ---
 
