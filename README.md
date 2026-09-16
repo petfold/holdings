@@ -53,6 +53,7 @@ restic -r b2:bucket:repo ls --json latest | ./holdings.py import-restic restic-b
 ./holdings.py diff drive-a drive-b       # on A but not B
 ./holdings.py media                      # media overview
 ./holdings.py stats                      # totals
+./holdings.py check                      # derived columns vs. the base tables
 ```
 
 `redundancy` turns your 3-2-1 policy into a checkable report.
@@ -150,7 +151,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **69 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **74 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

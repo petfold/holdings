@@ -262,6 +262,45 @@ def is_excluded(rel_path: str, name: str, patterns: list[str]) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Derived state
+# --------------------------------------------------------------------------
+
+# Some columns are a cache over the base tables -- `instances.name` is the
+# basename of `instances.path`. They exist so the queries people actually run
+# are index lookups rather than scans.
+#
+# A cache that is quietly wrong is worse here than no cache at all. These
+# columns feed the question "do I have a backup of this?", and a stale yes is
+# the single answer this tool must never give: it is the one that ends with
+# someone wiping a drive. So the recomputation stays available, the writers
+# refresh it, and a test asserts the two agree.
+
+def derived_drift(conn) -> list[str]:
+    """Describe every disagreement between stored derived state and a fresh
+    recomputation from the base tables. Empty list means consistent."""
+    problems = []
+    wrong = [path for path, name in
+             conn.execute("SELECT path, name FROM instances")
+             if name != basename(path)]
+    if wrong:
+        problems.append(
+            f"instances.name disagrees with path on {len(wrong)} row(s), "
+            f"e.g. {wrong[0]!r}")
+    return problems
+
+
+def cmd_check(conn, args):
+    problems = derived_drift(conn)
+    if not problems:
+        print("derived state is consistent with the base tables")
+        return
+    for p in problems:
+        print(f"DRIFT: {p}", file=sys.stderr)
+    sys.exit("re-run `scan` on the affected media to rebuild derived state"
+             " (it is a cache; the base tables are unaffected)")
+
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
@@ -710,6 +749,10 @@ def build_parser():
 
     s = sub.add_parser("stats", help="catalog totals")
     s.set_defaults(func=cmd_stats, writes=False)
+
+    s = sub.add_parser("check",
+                       help="verify derived columns against the base tables")
+    s.set_defaults(func=cmd_check, writes=False)
 
     s = sub.add_parser("project-ontodag",
                        help="emit sys: placement projection (JSON lines)")

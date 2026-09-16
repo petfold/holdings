@@ -781,3 +781,102 @@ def test_migration_is_idempotent(tmp_path):
     conn = sqlite3.connect(db)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(instances)")]
     assert cols.count("name") == 1
+
+
+# ----------------------------------------------------------- derived state
+
+# `instances.name` is a cache over `instances.path`. These pin that it cannot
+# drift unnoticed, because the columns it will grow in future answer "do I
+# have a backup of this?" and a stale yes is the answer that gets a drive
+# wiped.
+
+def test_check_reports_a_consistent_catalog(run, capsys, tmp_path):
+    write(tmp_path / "disk" / "sub" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    capsys.readouterr()
+    run("check")
+    assert "consistent" in capsys.readouterr().out
+
+
+def test_check_detects_drift_and_does_not_pretend_otherwise(run, db, capsys,
+                                                            tmp_path):
+    write(tmp_path / "disk" / "sub" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    with sqlite3.connect(db) as c:                  # corrupt the cache
+        c.execute("UPDATE instances SET name='wrong.txt'")
+    with pytest.raises(SystemExit) as e:
+        run("check")
+    assert "cache" in str(e.value)
+    assert "DRIFT" in capsys.readouterr().err
+
+
+def test_check_is_read_only_so_it_works_on_a_published_catalog():
+    import argparse
+    [subs] = [a for a in holdings.build_parser()._actions
+              if isinstance(a, argparse._SubParsersAction)]
+    assert subs.choices["check"].get_default("writes") is False
+
+
+def test_derived_state_survives_an_arbitrary_sequence_of_writes(
+        db, run, tmp_path, capsys):
+    """The property that matters: after any mix of write commands, stored
+    derived state equals a fresh recomputation."""
+    import random
+    random.seed(11)
+    root = tmp_path / "disk"
+    run("add-medium", "d", "--kind", "drive")
+    run("add-medium", "e", "--kind", "drive", "--backup")
+
+    for step in range(12):
+        action = random.choice(["add", "rename", "delete", "rescan", "medium"])
+        if action == "add":
+            depth = random.randint(0, 3)
+            d = root.joinpath(*[f"lvl{i}" for i in range(depth)])
+            write(d / f"f{step}.txt", f"content-{step}")
+        elif action == "rename":
+            files = sorted(root.rglob("*.txt"))
+            if files:
+                f = random.choice(files)
+                f.rename(f.with_name(f"renamed{step}.txt"))
+        elif action == "delete":
+            files = sorted(root.rglob("*.txt"))
+            if files:
+                random.choice(files).unlink()
+        elif action == "medium":
+            run("add-medium", random.choice("de"), "--kind", "drive",
+                "--backup")
+        root.mkdir(parents=True, exist_ok=True)
+        run("scan", random.choice("de"), str(root))
+        capsys.readouterr()
+
+        # A raw connection on purpose: db_connect() migrates, which
+        # backfills NULL names and would repair a writer bug before the
+        # assertion could see it.
+        conn = sqlite3.connect(db)
+        try:
+            assert holdings.derived_drift(conn) == [], f"drift at step {step}"
+        finally:
+            conn.close()
+
+
+def test_import_restic_also_keeps_derived_state_consistent(db, run, tmp_path,
+                                                           capsys):
+    listing = tmp_path / "ls.json"
+    listing.write_text("\n".join([
+        json.dumps({"struct_type": "node", "type": "file",
+                    "path": "/deep/nested/report.pdf", "size": 120}),
+        json.dumps({"struct_type": "node", "type": "file",
+                    "path": "/top.txt", "size": 4}),
+    ]))
+    run("add-medium", "r", "--kind", "restic-repo", "--backup")
+    run("import-restic", "r", str(listing))
+    capsys.readouterr()
+    conn = sqlite3.connect(db)          # raw: see what the writer wrote
+    try:
+        assert holdings.derived_drift(conn) == []
+        names = {r[0] for r in conn.execute("SELECT name FROM instances")}
+        assert names == {"report.pdf", "top.txt"}
+    finally:
+        conn.close()
