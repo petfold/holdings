@@ -201,6 +201,34 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
       * **Sync mirrors as a placement source** — v0.2's Syncthing REST
         adapter feeds `mirror`, and the class is now there to receive it.
 
+- [x] **Sites: what fails together** (DONE 2026-09-16). `media.site`, plus
+      `content.backup_sites` / `backup_kinds`, and `redundancy --min-sites`
+      / `--min-kinds`. The README had called this a 3-2-1 report since v0.1
+      while checking only the 3; the 2 was derivable from `kind` but never
+      tested, and the 1 had nowhere to live, `location_hint` being free
+      text. Unsited media collapse into one unknown site — under-counting
+      separation is the safe direction. The default question keeps its
+      index; the full form needs an OR across columns, so it costs a scan
+      and only runs when asked for.
+- [x] **Seen is not verified** (DONE 2026-09-16). `instances.verified_at`
+      and `evidence` (hashed / metadata / imported), `media.verified_at`,
+      `content.backup_verified_at`, and `redundancy --verified-within`.
+      A rescan reuses the stored hash without opening the file and bit rot
+      changes neither size nor mtime, so a copy could be faithfully
+      catalogued for years and be gone. A `--full` scan now reports a path
+      that hashed differently instead of swallowing it, and an unreadable
+      file is kept and flagged rather than pruned as deleted — a failing
+      drive and a tidied-up one used to produce the same catalog change.
+
+      Evidence decays the way a lease does. That is the same shape twice
+      now, and it may deserve stating once: the catalog treats a fact from
+      five years ago exactly like one from yesterday unless something says
+      otherwise.
+- [ ] **A verification schedule.** `--verified-within` asks the question but
+      nothing plans the answer: which medium is most overdue, and what would
+      it cost to re-read it. Wants `holdings verify --due` more than it
+      wants another column.
+
 ## Future — the browser
 
 Not scheduled; recorded so it is not re-derived later. OntoDAG is intended

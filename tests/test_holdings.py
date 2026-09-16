@@ -1376,3 +1376,274 @@ def test_an_old_catalog_keeps_what_it_claimed(tmp_path, capsys):
         assert holdings.derived_drift(conn) == []
     finally:
         conn.close()
+
+
+# ------------------------------------------------- unreadable, not deleted
+
+def test_an_unreadable_file_is_not_pruned_as_deleted(run, db, capsys,
+                                                     tmp_path):
+    """A failing drive and a tidied-up one look identical to the prune.
+
+    Only one of them means the copy is gone, and getting it wrong lowers
+    the recorded copy count on content that is still there — the exact
+    direction this tool must never err in.
+    """
+    root = tmp_path / "drive"
+    write(root / "readable.txt", "fine")
+    bad = write(root / "rotten.txt", "was fine")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT COUNT(*) FROM instances").fetchone()[0] == 2
+
+    bad.chmod(0o000)                       # now unreadable, still present
+    try:
+        run("scan", "d", str(root), "--full")
+        err = capsys.readouterr().err
+        with sqlite3.connect(db) as c:
+            paths = {p for p, in c.execute("SELECT path FROM instances")}
+        assert paths == {"readable.txt", "rotten.txt"}, "the entry was pruned"
+        assert "could not be read" in err
+    finally:
+        bad.chmod(0o644)
+
+
+def test_a_genuinely_removed_file_is_still_pruned(run, db, capsys, tmp_path):
+    """The fix must not make the catalog stop noticing real deletions."""
+    root = tmp_path / "drive"
+    write(root / "keep.txt", "keep")
+    gone = write(root / "gone.txt", "gone")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(root))
+    gone.unlink()
+    run("scan", "d", str(root))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert {p for p, in c.execute("SELECT path FROM instances")} \
+            == {"keep.txt"}
+
+
+# --------------------------------------------------------- sites and 3-2-1
+
+@pytest.fixture
+def two_drives_one_room(run, tmp_path, capsys):
+    """The case that motivated sites: two backup drives, same room."""
+    src, d1, d2 = tmp_path / "src", tmp_path / "d1", tmp_path / "d2"
+    write(src / "photo.jpg", "photo")
+    write(d1 / "photo.jpg", "photo")
+    write(d2 / "photo.jpg", "photo")
+    run("add-medium", "laptop", "--kind", "laptop", "--site", "home")
+    run("add-medium", "drive-a", "--kind", "drive",
+        "--durability", "independent", "--site", "home")
+    run("add-medium", "drive-b", "--kind", "drive",
+        "--durability", "independent", "--site", "home")
+    run("scan", "laptop", str(src))
+    run("scan", "drive-a", str(d1))
+    run("scan", "drive-b", str(d2))
+    capsys.readouterr()
+    return run
+
+
+def test_two_copies_in_one_room_satisfy_copies_but_not_sites(
+        two_drives_one_room, db, capsys):
+    """Fire, flood, theft and a ransomware process walking mounted volumes
+    take both. The count says two; the separation says one."""
+    run = two_drives_one_room
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT backup_copies, backup_sites, backup_kinds"
+                         " FROM content").fetchone() == (2, 1, 1)
+    run("redundancy", "--min-copies", "2", "--exit-code")     # passes
+    with pytest.raises(SystemExit) as e:
+        run("redundancy", "--min-copies", "2", "--min-sites", "2",
+            "--exit-code")
+    assert e.value.code == 1
+
+
+def test_moving_one_drive_offsite_satisfies_the_policy(
+        two_drives_one_room, capsys):
+    run = two_drives_one_room
+    run("add-medium", "drive-b", "--kind", "drive",
+        "--durability", "independent", "--site", "budapest")
+    capsys.readouterr()
+    run("redundancy", "--min-copies", "2", "--min-sites", "2", "--exit-code")
+
+
+def test_media_without_a_site_are_not_assumed_separate(run, capsys, tmp_path):
+    """Conservative by design: unknown is not the same as known-different,
+    so unsited media collapse into one site rather than inflating the count."""
+    d1, d2 = tmp_path / "d1", tmp_path / "d2"
+    write(d1 / "a.txt", "a")
+    write(d2 / "a.txt", "a")
+    run("add-medium", "x", "--kind", "drive", "--durability", "independent")
+    run("add-medium", "y", "--kind", "drive", "--durability", "independent")
+    run("scan", "x", str(d1))
+    run("scan", "y", str(d2))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "2", "--min-sites", "2",
+            "--exit-code")
+
+
+def test_min_kinds_is_the_two_media_types_of_321(run, db, capsys, tmp_path):
+    d1, d2 = tmp_path / "d1", tmp_path / "d2"
+    write(d1 / "a.txt", "a")
+    write(d2 / "a.txt", "a")
+    run("add-medium", "drive", "--kind", "drive",
+        "--durability", "independent", "--site", "home")
+    run("add-medium", "restic", "--kind", "restic-repo",
+        "--durability", "independent", "--site", "cloud")
+    run("scan", "drive", str(d1))
+    run("scan", "restic", str(d2))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT backup_kinds FROM content").fetchone()[0] == 2
+    run("redundancy", "--min-copies", "2", "--min-sites", "2",
+        "--min-kinds", "2", "--exit-code")
+
+
+def test_a_site_survives_re_registering_the_medium(run, db, capsys):
+    run("add-medium", "d", "--kind", "drive", "--site", "budapest")
+    run("add-medium", "d", "--kind", "drive", "--location", "moved shelf")
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT site FROM media").fetchone()[0] == "budapest"
+
+
+def test_the_full_policy_report_names_what_failed(two_drives_one_room,
+                                                  capsys):
+    run = two_drives_one_room
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "2", "--min-sites", "2",
+            "--exit-code")
+    out = capsys.readouterr().out
+    assert "2 sites" in out and "SITE" in out
+
+
+def test_policy_json_carries_the_thresholds(two_drives_one_room, capsys):
+    run = two_drives_one_room
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-sites", "2", "--json", "--exit-code")
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["min_sites"] == 2
+    assert doc["items"][0]["backup_sites"] == 1
+
+
+# ------------------------------------------- seen, versus actually verified
+
+def test_a_rescan_does_not_re_read_the_file(run, db, capsys, tmp_path):
+    """The distinction the columns exist for: `seen_at` means the filesystem
+    still listed it at this size. Only `verified_at` means someone read the
+    bytes — and bit rot changes neither size nor mtime."""
+    root = tmp_path / "drive"
+    write(root / "a.txt", "content")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    with sqlite3.connect(db) as c:
+        first, evidence = c.execute(
+            "SELECT verified_at, evidence FROM instances").fetchone()
+    assert evidence == "hashed" and first is not None
+
+    run("scan", "d", str(root))                    # unchanged: no read
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        seen, verified, evidence = c.execute(
+            "SELECT seen_at, verified_at, evidence FROM instances").fetchone()
+    assert evidence == "metadata"
+    assert verified == first, "verification date must not advance on a re-list"
+    assert seen > verified, "but the sighting is fresh"
+
+
+def test_a_full_scan_re_verifies(run, db, capsys, tmp_path):
+    root = tmp_path / "drive"
+    write(root / "a.txt", "content")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    with sqlite3.connect(db) as c:
+        first = c.execute("SELECT verified_at FROM instances").fetchone()[0]
+    run("scan", "d", str(root), "--full")
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        again, evidence = c.execute(
+            "SELECT verified_at, evidence FROM instances").fetchone()
+    assert again > first and evidence == "hashed"
+
+
+def test_content_changing_under_us_is_reported_not_swallowed(
+        run, db, capsys, tmp_path):
+    """On a medium nobody edits, a changed hash is what rot looks like. The
+    upsert used to replace the hash and say nothing."""
+    root = tmp_path / "drive"
+    f = write(root / "a.txt", "original")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    capsys.readouterr()
+
+    f.write_bytes(b"rotted!!")                     # same length, new bytes
+    run("scan", "d", str(root), "--full")
+    err = capsys.readouterr().err
+    assert "hashed to something other than the catalog recorded" in err
+    assert "was sha256:" in err and "now sha256:" in err
+
+
+def test_imported_listings_are_marked_as_the_weakest_evidence(
+        run, db, capsys, tmp_path):
+    listing = tmp_path / "ls.json"
+    listing.write_text(json.dumps(
+        {"struct_type": "node", "type": "file", "path": "/x.pdf", "size": 9}))
+    run("add-medium", "r", "--kind", "restic-repo",
+        "--durability", "independent")
+    run("import-restic", "r", str(listing))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT evidence, verified_at FROM instances"
+                         ).fetchone() == ("imported", None)
+
+
+def test_verified_within_discounts_stale_evidence(run, db, capsys, tmp_path):
+    """A copy nobody has read in years is weak evidence — and for the drive
+    in the safe in another country, that is the normal state."""
+    root = tmp_path / "drive"
+    write(root / "a.txt", "content")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    capsys.readouterr()
+    run("redundancy", "--min-copies", "1", "--verified-within", "30",
+        "--exit-code")                             # just read it: passes
+
+    with sqlite3.connect(db) as c:                 # two years pass
+        old = time.time() - 730 * 86400
+        c.execute("UPDATE instances SET verified_at=?", (old,))
+        c.execute("UPDATE content SET backup_verified_at=?", (old,))
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "1", "--verified-within", "30",
+            "--exit-code")
+    assert "read within 30d" in capsys.readouterr().out
+
+
+def test_never_verified_content_counts_as_unverified(run, db, capsys,
+                                                     tmp_path):
+    listing = tmp_path / "ls.json"
+    listing.write_text(json.dumps(
+        {"struct_type": "node", "type": "file", "path": "/x.pdf", "size": 9}))
+    run("add-medium", "r", "--kind", "restic-repo",
+        "--durability", "independent")
+    run("import-restic", "r", str(listing))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "1", "--verified-within", "365",
+            "--exit-code")
+    assert "never" in capsys.readouterr().out
+
+
+def test_media_reports_when_it_was_last_actually_read(run, db, capsys,
+                                                      tmp_path):
+    root = tmp_path / "drive"
+    write(root / "a.txt", "content")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    capsys.readouterr()
+    run("media")
+    out = capsys.readouterr().out
+    assert "LAST READ" in out
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT verified_at FROM media").fetchone()[0]
