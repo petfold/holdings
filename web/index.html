@@ -57,7 +57,12 @@
     font: inherit; padding: 7px 14px; border-radius: 6px; cursor: pointer;
     border: 1px solid var(--accent); background: var(--accent); color: var(--bg);
   }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  /* Tables scroll sideways rather than clipping. Measured: the media
+     table needs 365px and a 390px phone gives the content box 326, so
+     without this the first view someone sees is cut off. */
+  .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; min-width: max-content; border-collapse: collapse;
+          font-size: 14px; }
   th, td { text-align: left; padding: 7px 10px 7px 0; border-bottom: 1px solid var(--line); }
   th { color: var(--dim); font-weight: 500; font-size: 12px;
        text-transform: uppercase; letter-spacing: 0.04em; }

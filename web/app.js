@@ -51,8 +51,18 @@ function economy(label, t0) {
     `${humanSize(s.fileSize)}) in ${(performance.now() - t0).toFixed(0)} ms`;
 }
 
-async function run(name, params = []) {
-  return db.query(Q[name], params);
+// One query at a time, always. wa-sqlite's async build steps statements on
+// a single connection handle and does not serialise: two overlapping
+// queries interleave and the second sees a database with no tables in it.
+// Enforced here rather than at the call sites so views can still use
+// Promise.all — which is how this was found, by the page failing to open a
+// catalog that the same queries read perfectly when run one after another.
+let queue = Promise.resolve();
+
+function run(name, params = []) {
+  const result = queue.then(() => db.query(Q[name], params));
+  queue = result.catch(() => {});      // a failure must not stall the queue
+  return result;
 }
 
 function table(head, rows) {
@@ -63,7 +73,8 @@ function table(head, rows) {
     '<tr>' + cells.map((c, i) =>
       `<td class="${head[i].num ? 'num' : ''} ${c.cls ?? ''}">${c.html}</td>`
     ).join('') + '</tr>').join('');
-  return `<table><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
+  return `<div class="scroll"><table><thead><tr>${ths}</tr></thead>`
+       + `<tbody>${trs}</tbody></table></div>`;
 }
 
 // ------------------------------------------------------------------ views
