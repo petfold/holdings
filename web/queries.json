@@ -12,5 +12,6 @@
   "policy_total": "SELECT COUNT(*) AS n FROM content WHERE backup_copies < ? OR backup_sites < ? OR backup_kinds < ?    OR (? > 0 AND COALESCE(backup_verified_at, 0) < ?)",
   "only_on_rows": "SELECT path, size FROM instances WHERE medium_id=? AND only_here=1 ORDER BY size DESC LIMIT ?",
   "only_on_totals": "SELECT only_here_count, only_here_bytes FROM media WHERE medium_id=?",
+  "due": "SELECT medium_id, kind, durability, site, verified_at, last_scanned,       file_count, byte_count, sole_backup_count, sole_backup_bytes  FROM media WHERE durability <> 'working' ORDER BY sole_backup_count > 0 DESC,          verified_at IS NULL DESC, verified_at ASC",
   "newest_scan": "SELECT MAX(last_scanned) AS newest FROM media"
 }
