@@ -97,18 +97,24 @@ async function showMedia() {
   const t0 = performance.now();
   const rows = await run('media');
   $('media-out').innerHTML = table(
-    [{ label: 'Medium' }, { label: 'Kind' }, { label: 'Files', num: true },
-     { label: 'Size', num: true }, { label: 'Only here', num: true },
-     { label: 'Last scan' }, { label: 'Location' }],
+    [{ label: 'Medium' }, { label: 'Kind' }, { label: 'Site' },
+     { label: 'Files', num: true }, { label: 'Size', num: true },
+     { label: 'Only here', num: true }, { label: 'Last scan' },
+     { label: 'Last read' }, { label: 'Location' }],
     rows.map((r) => [
       { html: `${esc(r.medium_id)} ${durabilityTag(r)}` },
       { html: esc(r.kind) },
+      { html: esc(r.site ?? '—') },
       { html: r.file_count.toLocaleString() },
       { html: humanSize(r.byte_count) },
       { html: r.only_here_count
           ? `<span class="tag danger">${r.only_here_count.toLocaleString()}</span>`
           : '0' },
       { html: day(r.last_scanned) },
+      // Seen is not verified: a rescan reuses the stored hash without
+      // opening the file, so this is the date someone actually read it.
+      { html: r.verified_at ? day(r.verified_at)
+          : '<span class="tag danger">never</span>' },
       { html: esc(r.location_hint ?? '') },
     ]));
   economy('media', t0);
