@@ -11,6 +11,9 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+# Reading a catalog published read-only by URL. Strictly optional: a local
+# catalog — the default, and the complete feature set — needs the stdlib only.
+swarm = ["swarmlite>=0.3.1"]
 
 [project.urls]
 Homepage = "https://github.com/petfold/holdings"

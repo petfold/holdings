@@ -9,7 +9,9 @@ Design principles (see the accompanying README):
   * Content hash (sha256) is the primary key. Paths, media, and
     categories are attributes of a hash, never identities.
   * Single writer (your backup-node laptop), many readers (the SQLite
-    file can be placed in a Syncthing folder and read anywhere).
+    file can be placed in a synced folder, or published read-only, and
+    read anywhere). How it travels is not this tool's business: the
+    catalog is a path, and everything below works on a local file.
   * Placement truth lives here, in SQLite. Semantic truth lives in
     OntoDAG. The `project-ontodag` command emits placement facts as a
     namespaced (`sys:`) projection for OntoDAG to ingest as a
@@ -45,13 +47,41 @@ CREATE TABLE IF NOT EXISTS media (
     location_hint TEXT,                      -- e.g. 'safe, Budapest flat'
     is_backup     INTEGER NOT NULL DEFAULT 0,-- counts toward redundancy as a backup copy
     notes         TEXT,
-    last_scanned  REAL
+    last_scanned  REAL,
+    file_count      INTEGER NOT NULL DEFAULT 0, -- derived from instances
+    byte_count      INTEGER NOT NULL DEFAULT 0,
+    only_here_count INTEGER NOT NULL DEFAULT 0, -- content held nowhere else
+    only_here_bytes INTEGER NOT NULL DEFAULT 0
+);
+
+-- How many content objects sit at each backup-copy count. `redundancy`
+-- needs a total for a threshold given at runtime, which no single stored
+-- number can answer -- but backup_copies takes very few distinct values,
+-- so summing this table reads a handful of rows instead of counting
+-- tens of thousands.
+CREATE TABLE IF NOT EXISTS backup_histogram (
+    backup_copies INTEGER PRIMARY KEY,
+    content_count INTEGER NOT NULL
+);
+
+-- One row (id=1) of totals that `stats` would otherwise scan the whole
+-- catalog to produce.
+CREATE TABLE IF NOT EXISTS catalog_summary (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    content_count  INTEGER NOT NULL DEFAULT 0,
+    content_bytes  INTEGER NOT NULL DEFAULT 0,
+    instance_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS content (
     hash       TEXT PRIMARY KEY,             -- 'sha256:...'
     size       INTEGER NOT NULL,
-    first_seen REAL NOT NULL
+    first_seen REAL NOT NULL,
+    -- Derived from instances+media, refreshed after every write. Added by
+    -- ALTER TABLE on older catalogs, so they stay last (see instances.name).
+    copies        INTEGER NOT NULL DEFAULT 0,-- distinct media holding it
+    backup_copies INTEGER NOT NULL DEFAULT 0,-- distinct *backup* media
+    example_path  TEXT                       -- lowest path, for reports
 );
 
 CREATE TABLE IF NOT EXISTS instances (
@@ -61,9 +91,13 @@ CREATE TABLE IF NOT EXISTS instances (
     size      INTEGER NOT NULL,
     mtime     REAL,                          -- NULL for imported (e.g. restic) listings
     seen_at   REAL NOT NULL,
+    -- Derived from path, stored because it is what gets searched for.
+    -- Added by ALTER TABLE on older catalogs, so it must stay last here:
+    -- fresh and migrated databases then agree on column order.
+    name      TEXT,                          -- basename of path
+    only_here INTEGER NOT NULL DEFAULT 0,    -- its content is on no other medium
     PRIMARY KEY (medium_id, path)
 );
-CREATE INDEX IF NOT EXISTS idx_instances_hash ON instances(hash);
 
 CREATE TABLE IF NOT EXISTS scans (
     scan_id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,6 +111,82 @@ CREATE TABLE IF NOT EXISTS scans (
 );
 """
 
+# Created after any migration, since an index can name a column that a
+# migration has only just added.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_instances_hash ON instances(hash);
+-- The primary key is (medium_id, path), so a lookup by path alone --
+-- `whereis <path>`, the commonest query there is -- would otherwise scan
+-- every instance. Cheap locally, ruinous over a network: measured at 9+
+-- minutes unfinished against a 125 MB catalog published to Swarm, versus
+-- 8 pages (0.03% of the file) with the index.
+CREATE INDEX IF NOT EXISTS idx_instances_path ON instances(path);
+-- And `whereis <bare filename>` searches the basename, which no index can
+-- serve from `path` (the pattern starts with a wildcard), hence `name`.
+CREATE INDEX IF NOT EXISTS idx_instances_name ON instances(name);
+-- `redundancy` reads content in (backup_copies, size) order and stops at
+-- --limit, so the index supplies both the filter and the ordering.
+CREATE INDEX IF NOT EXISTS idx_content_redundancy
+    ON content(backup_copies, size DESC);
+-- `only-on` is the danger list, so it has to be usable. Driving it from
+-- the singletons (copies=1) in size order and probing instances by hash
+-- costs the size of that set; driving it from the medium's rows costs the
+-- whole medium, which measured at minutes over a network.
+CREATE INDEX IF NOT EXISTS idx_content_singletons
+    ON content(copies, size DESC);
+-- `only-on` wants one medium's singletons, largest first. Carrying the
+-- flag on the instance row lets one index range scan answer that, instead
+-- of walking every singleton in the catalog and probing for its medium.
+CREATE INDEX IF NOT EXISTS idx_instances_only_here
+    ON instances(medium_id, only_here, size DESC);
+"""
+
+
+def basename(path: str) -> str:
+    """The name part of a stored (always '/'-separated) relative path."""
+    return path.rpartition("/")[2]
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Bring an older catalog up to the current schema, in place.
+
+    Deliberately not "drop it and rescan". The contract says everything is
+    regenerable by re-scanning, but that is not a licence to discard the
+    catalog: its whole value is facts about media that are *not* reachable
+    right now — a drive in a safe in another country cannot be rescanned on
+    demand, and dropping the file would lose exactly the part that cannot be
+    rebuilt. Migrations here are additive and idempotent.
+    """
+    added = False
+    for table, column, decl in [
+        ("instances", "name", "TEXT"),
+        ("instances", "only_here", "INTEGER NOT NULL DEFAULT 0"),
+        ("media", "only_here_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("media", "only_here_bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ("content", "copies", "INTEGER NOT NULL DEFAULT 0"),
+        ("content", "backup_copies", "INTEGER NOT NULL DEFAULT 0"),
+        ("content", "example_path", "TEXT"),
+        ("media", "file_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("media", "byte_count", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            added = True
+
+    stale = conn.execute(
+        "SELECT medium_id, path FROM instances WHERE name IS NULL").fetchall()
+    if stale:
+        conn.executemany(
+            "UPDATE instances SET name=? WHERE medium_id=? AND path=?",
+            [(basename(path), mid, path) for mid, path in stale])
+    if added:
+        # The counts default to 0, which would read as "no backups anywhere"
+        # until something refreshed them -- so refresh before anyone can ask.
+        refresh_derived(conn)
+    if stale or added:
+        conn.commit()
+
 
 def db_connect(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -84,7 +194,91 @@ def db_connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    migrate(conn)
+    conn.executescript(INDEXES)
     return conn
+
+
+# --------------------------------------------------------------------------
+# Published catalogs (optional)
+# --------------------------------------------------------------------------
+
+# A catalog is normally a local file. It can also be *published* read-only and
+# opened by URL, which is what lets a phone or a second laptop answer `whereis`
+# without holding the file or pairing with anything. This is an optional extra
+# (`pip install 'holdings[swarm]'`): nothing here is imported, installed or
+# required for a local catalog, which remains the default and complete path.
+#
+# `bzz://` pins an immutable version, `bzzf://` follows a feed to the latest.
+# `file://` and `memory://` are swarmlite's own local forms — the identical
+# code path with no node involved, which is how to try the read path (or read
+# a local catalog strictly read-only) before publishing anything.
+REMOTE_SCHEMES = ("bzz://", "bzzf://", "file://", "memory://")
+
+_WRITE_ON_PUBLISHED = """\
+A published catalog is read-only. Placement is written where the scanning
+happens, and published afterwards:
+    holdings --db <local.sqlite> {cmd} ...
+    swarmlite publish <local.sqlite> --encrypt --feed holdings"""
+
+
+def is_remote_url(db: str) -> bool:
+    return db.startswith(REMOTE_SCHEMES)
+
+
+def warn_if_uncheckpointed(url: str) -> None:
+    """A `file://` read ignores an un-checkpointed WAL, silently.
+
+    swarmlite's read-only VFS reports the WAL absent. That is right for a
+    published artifact — `swarmlite publish` checkpoints into
+    journal_mode=DELETE first, so `bzz://` and `bzzf://` are always whole —
+    but a `file://` URL can point at a live catalog with a writer's sidecar
+    beside it. Measured: an insert sitting in the WAL is simply not there.
+    Staleness in a placement catalog reads as "no backup exists", which is
+    the one wrong answer this tool must not give quietly.
+    """
+    if not url.startswith("file://"):
+        return
+    wal = Path(url[len("file://"):] + "-wal")
+    try:
+        empty = wal.stat().st_size == 0
+    except OSError:
+        return
+    if not empty:
+        print(f"warning: '{wal.name}' is present, so this reads the last"
+              f" checkpointed state — writes still in the WAL are invisible."
+              f" Close the writer first (or publish, which checkpoints).",
+              file=sys.stderr)
+
+
+def remote_connect(url: str):
+    """Open a published catalog read-only, via swarmlite.
+
+    swarmlite maps SQLite's 4 KB pages onto ranged reads, so an indexed
+    lookup such as `whereis` fetches a handful of pages rather than the
+    whole catalog. The import is deliberately lazy and deliberately late:
+    a local catalog never pays for it, and a machine without the extra
+    only ever meets this error by explicitly asking for a URL.
+    """
+    try:
+        import swarmlite
+    except ModuleNotFoundError:
+        sys.exit(f"opening '{url}' needs the optional published-catalog"
+                 f" reader:\n"
+                 f"    pip install 'holdings[swarm]'\n"
+                 f"A local catalog file needs nothing beyond the stdlib.")
+    warn_if_uncheckpointed(url)
+    return swarmlite.connect(url)
+
+
+def open_catalog(db: str, *, writes: bool, cmd: str):
+    """Connect to a catalog, local or published, per the `--db` path given."""
+    if not is_remote_url(db):
+        return db_connect(db)
+    if writes:
+        sys.exit(f"'{cmd}' writes to the catalog, but '{db}' is published.\n"
+                 + _WRITE_ON_PUBLISHED.format(cmd=cmd))
+    return remote_connect(db)
 
 
 # --------------------------------------------------------------------------
@@ -131,6 +325,179 @@ def is_excluded(rel_path: str, name: str, patterns: list[str]) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Derived state
+# --------------------------------------------------------------------------
+
+# Some columns are a cache over the base tables -- `instances.name` is the
+# basename of `instances.path`. They exist so the queries people actually run
+# are index lookups rather than scans.
+#
+# A cache that is quietly wrong is worse here than no cache at all. These
+# columns feed the question "do I have a backup of this?", and a stale yes is
+# the single answer this tool must never give: it is the one that ends with
+# someone wiping a drive. So the recomputation stays available, the writers
+# refresh it, and a test asserts the two agree.
+
+# One grouped pass over instances: what every content row's derived columns
+# should be. MIN(path) rather than an arbitrary one, so the value is
+# reproducible and drift is therefore detectable.
+_GROUPED = """
+SELECT i.hash AS hash,
+       COUNT(DISTINCT i.medium_id) AS copies,
+       COUNT(DISTINCT CASE WHEN m.is_backup THEN i.medium_id END)
+           AS backup_copies,
+       MIN(i.path) AS example_path
+  FROM instances i JOIN media m ON m.medium_id = i.medium_id
+ GROUP BY i.hash
+"""
+
+_RECOMPUTE = f"""
+SELECT c.hash, COALESCE(x.copies, 0), COALESCE(x.backup_copies, 0),
+       x.example_path
+  FROM content c LEFT JOIN ({_GROUPED}) x ON x.hash = c.hash
+"""
+
+
+def refresh_derived(conn) -> None:
+    """Recompute every derived column from the base tables.
+
+    Wholesale, not incrementally -- the same choice the projection contract
+    makes, and for the same reason: staleness is a permitted failure mode,
+    drift is not, and a full rebuild cannot half-apply. It runs after each
+    write command, which is rare (a scan already walked a filesystem), so
+    the cost lands where nobody is waiting on a query.
+
+    It must run after `add-medium` too, not just after a scan: flipping
+    --backup on one medium changes backup_copies for everything on it.
+    """
+    # Staged through a temp table rather than UPDATE..FROM, which needs
+    # SQLite 3.33 -- newer than `requires-python = ">=3.10"` guarantees.
+    conn.execute("DROP TABLE IF EXISTS temp._counts")
+    conn.execute(f"CREATE TEMP TABLE _counts AS {_GROUPED}")
+    conn.execute("CREATE INDEX temp._counts_hash ON _counts(hash)")
+    conn.execute(
+        "UPDATE content SET"
+        "  copies = COALESCE("
+        "    (SELECT copies FROM _counts WHERE hash = content.hash), 0),"
+        "  backup_copies = COALESCE("
+        "    (SELECT backup_copies FROM _counts WHERE hash = content.hash), 0),"
+        "  example_path ="
+        "    (SELECT example_path FROM _counts WHERE hash = content.hash)")
+    conn.execute("DROP TABLE temp._counts")
+    conn.execute(
+        "UPDATE instances SET only_here = COALESCE("
+        "  (SELECT c.copies = 1 FROM content c WHERE c.hash = instances.hash),"
+        "  0)")
+    # After content.copies, which only_here_* depends on.
+    conn.execute(
+        "UPDATE media SET"
+        "  file_count = (SELECT COUNT(*) FROM instances"
+        "                 WHERE medium_id = media.medium_id),"
+        "  byte_count = COALESCE((SELECT SUM(size) FROM instances"
+        "                          WHERE medium_id = media.medium_id), 0),"
+        "  only_here_count = (SELECT COUNT(*) FROM instances i"
+        "     JOIN content c ON c.hash = i.hash"
+        "    WHERE i.medium_id = media.medium_id AND c.copies = 1),"
+        "  only_here_bytes = COALESCE((SELECT SUM(c.size) FROM instances i"
+        "     JOIN content c ON c.hash = i.hash"
+        "    WHERE i.medium_id = media.medium_id AND c.copies = 1), 0)")
+    conn.execute("DELETE FROM backup_histogram")
+    conn.execute(
+        "INSERT INTO backup_histogram (backup_copies, content_count)"
+        " SELECT backup_copies, COUNT(*) FROM content GROUP BY backup_copies")
+    # Query plans here are genuinely data-dependent -- whether `only-on` is
+    # better driven from the singleton set or from the medium depends on
+    # their relative sizes -- so give the planner current statistics rather
+    # than forcing a join order that is right for one shape of catalog.
+    conn.execute("ANALYZE")
+    conn.execute(
+        "INSERT INTO catalog_summary (id, content_count, content_bytes,"
+        "                             instance_count)"
+        " VALUES (1, (SELECT COUNT(*) FROM content),"
+        "            (SELECT COALESCE(SUM(size), 0) FROM content),"
+        "            (SELECT COUNT(*) FROM instances))"
+        " ON CONFLICT(id) DO UPDATE SET"
+        "   content_count=excluded.content_count,"
+        "   content_bytes=excluded.content_bytes,"
+        "   instance_count=excluded.instance_count")
+
+
+def derived_drift(conn) -> list[str]:
+    """Describe every disagreement between stored derived state and a fresh
+    recomputation from the base tables. Empty list means consistent."""
+    problems = []
+    wrong = [path for path, name in
+             conn.execute("SELECT path, name FROM instances")
+             if name != basename(path)]
+    if wrong:
+        problems.append(
+            f"instances.name disagrees with path on {len(wrong)} row(s), "
+            f"e.g. {wrong[0]!r}")
+
+    flags = conn.execute(
+        "SELECT COUNT(*) FROM instances i LEFT JOIN content c"
+        "    ON c.hash = i.hash"
+        " WHERE i.only_here <> COALESCE(c.copies = 1, 0)").fetchone()[0]
+    if flags:
+        problems.append(
+            f"instances.only_here disagrees with content.copies"
+            f" on {flags} row(s)")
+
+    expected = {h: row for h, *row in conn.execute(_RECOMPUTE)}
+    stored = {h: row for h, *row in conn.execute(
+        "SELECT hash, copies, backup_copies, example_path FROM content")}
+    off = [h for h in stored if stored[h] != expected.get(h)]
+    if off:
+        problems.append(
+            f"content copy counts are stale on {len(off)} row(s), "
+            f"e.g. {off[0]}: stored {stored[off[0]]}, "
+            f"recomputed {expected.get(off[0])}")
+
+    for mid, *stored_totals in conn.execute(
+            "SELECT medium_id, file_count, byte_count, only_here_count,"
+            "       only_here_bytes FROM media"):
+        real = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(i.size), 0),"
+            "       COALESCE(SUM(c.copies = 1), 0),"
+            "       COALESCE(SUM(CASE WHEN c.copies = 1 THEN c.size END), 0)"
+            "  FROM instances i JOIN content c ON c.hash = i.hash"
+            " WHERE i.medium_id=?", (mid,)).fetchone()
+        if tuple(stored_totals) != tuple(real):
+            problems.append(f"media '{mid}' totals stale: stored "
+                            f"{tuple(stored_totals)}, recomputed {tuple(real)}")
+
+    hist = dict(conn.execute(
+        "SELECT backup_copies, content_count FROM backup_histogram"))
+    real_hist = dict(conn.execute(
+        "SELECT backup_copies, COUNT(*) FROM content GROUP BY backup_copies"))
+    if hist != real_hist:
+        problems.append(f"backup histogram stale: stored {hist},"
+                        f" recomputed {real_hist}")
+
+    row = conn.execute("SELECT content_count, content_bytes, instance_count"
+                       " FROM catalog_summary WHERE id=1").fetchone()
+    real = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM content),"
+        "       (SELECT COALESCE(SUM(size), 0) FROM content),"
+        "       (SELECT COUNT(*) FROM instances)").fetchone()
+    if row is None or tuple(row) != tuple(real):
+        problems.append(f"catalog summary stale: stored {row},"
+                        f" recomputed {tuple(real)}")
+    return problems
+
+
+def cmd_check(conn, args):
+    problems = derived_drift(conn)
+    if not problems:
+        print("derived state is consistent with the base tables")
+        return
+    for p in problems:
+        print(f"DRIFT: {p}", file=sys.stderr)
+    sys.exit("re-run `scan` on the affected media to rebuild derived state"
+             " (it is a cache; the base tables are unaffected)")
+
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
@@ -143,6 +510,7 @@ def cmd_add_medium(conn, args):
         (args.medium_id, args.kind, args.location, int(args.backup),
          args.notes, args.medium_id),
     )
+    refresh_derived(conn)       # --backup here changes every backup_copies
     conn.commit()
     print(f"medium '{args.medium_id}' registered"
           f" (kind={args.kind}, backup={'yes' if args.backup else 'no'})")
@@ -150,12 +518,9 @@ def cmd_add_medium(conn, args):
 
 def cmd_media(conn, args):
     rows = conn.execute(
-        "SELECT m.medium_id, m.kind, m.is_backup, m.location_hint,"
-        "       m.last_scanned,"
-        "       (SELECT COUNT(*) FROM instances i WHERE i.medium_id=m.medium_id),"
-        "       (SELECT COALESCE(SUM(size),0) FROM instances i"
-        "         WHERE i.medium_id=m.medium_id)"
-        " FROM media m ORDER BY m.medium_id").fetchall()
+        "SELECT medium_id, kind, is_backup, location_hint, last_scanned,"
+        "       file_count, byte_count"
+        " FROM media ORDER BY medium_id").fetchall()
     if not rows:
         print("no media registered yet — use: holdings add-medium <id> --kind drive")
         return
@@ -228,13 +593,15 @@ def cmd_scan(conn, args):
                 " ON CONFLICT(hash) DO NOTHING",
                 (file_hash, st.st_size, time.time()))
             conn.execute(
-                "INSERT INTO instances (medium_id, path, hash, size, mtime, seen_at)"
-                " VALUES (?,?,?,?,?,?)"
+                "INSERT INTO instances"
+                " (medium_id, path, name, hash, size, mtime, seen_at)"
+                " VALUES (?,?,?,?,?,?,?)"
                 " ON CONFLICT(medium_id, path) DO UPDATE SET"
-                "   hash=excluded.hash, size=excluded.size,"
+                "   name=excluded.name, hash=excluded.hash,"
+                "   size=excluded.size,"
                 "   mtime=excluded.mtime, seen_at=excluded.seen_at",
-                (args.medium_id, rel_path, file_hash, st.st_size,
-                 st.st_mtime, time.time()))
+                (args.medium_id, rel_path, basename(rel_path), file_hash,
+                 st.st_size, st.st_mtime, time.time()))
             if files_seen % 500 == 0:
                 conn.commit()
                 print(f"  … {files_seen} files ({human_size(bytes_seen)})",
@@ -253,6 +620,7 @@ def cmd_scan(conn, args):
         "UPDATE scans SET finished=?, files_seen=?, bytes_seen=?, hashed=?"
         " WHERE scan_id=?",
         (time.time(), files_seen, bytes_seen, hashed, scan_id))
+    refresh_derived(conn)
     conn.commit()
     print(f"scan of '{args.medium_id}' complete: {files_seen} files"
           f" ({human_size(bytes_seen)}), {hashed} hashed,"
@@ -301,17 +669,20 @@ def cmd_import_restic(conn, args):
                     "INSERT INTO content (hash, size, first_seen) VALUES (?,?,?)"
                     " ON CONFLICT(hash) DO NOTHING", (h, size, time.time()))
             conn.execute(
-                "INSERT INTO instances (medium_id, path, hash, size, mtime, seen_at)"
-                " VALUES (?,?,?,?,NULL,?)"
+                "INSERT INTO instances"
+                " (medium_id, path, name, hash, size, mtime, seen_at)"
+                " VALUES (?,?,?,?,?,NULL,?)"
                 " ON CONFLICT(medium_id, path) DO UPDATE SET"
-                "   hash=excluded.hash, size=excluded.size, seen_at=excluded.seen_at",
-                (args.medium_id, path, h, size, time.time()))
+                "   name=excluded.name, hash=excluded.hash,"
+                "   size=excluded.size, seen_at=excluded.seen_at",
+                (args.medium_id, path, basename(path), h, size, time.time()))
             count += 1
     conn.execute(
         "DELETE FROM instances WHERE medium_id=? AND seen_at<?",
         (args.medium_id, started))
     conn.execute("UPDATE media SET last_scanned=? WHERE medium_id=?",
                  (time.time(), args.medium_id))
+    refresh_derived(conn)
     conn.commit()
     print(f"imported {count} entries into '{args.medium_id}'"
           f" (exact hashes where filename+size uniquely matched known content;"
@@ -366,8 +737,8 @@ def resolve_hash(conn, target: str):
     if row:
         return row[0]
     rows = conn.execute(
-        "SELECT DISTINCT hash FROM instances WHERE path LIKE ? LIMIT 2",
-        ("%/" + target,)).fetchall()
+        "SELECT DISTINCT hash FROM instances WHERE name=? LIMIT 2",
+        (target,)).fetchall()
     if len(rows) == 1:
         return rows[0][0]
     if len(rows) > 1:
@@ -379,29 +750,17 @@ def resolve_hash(conn, target: str):
 def cmd_redundancy(conn, args):
     """Content with fewer than --min-copies copies on *backup* media."""
     rows = conn.execute(
-        "SELECT * FROM ("
-        "  SELECT c.hash, c.size,"
-        "    (SELECT COUNT(DISTINCT i.medium_id) FROM instances i"
-        "      JOIN media m ON m.medium_id=i.medium_id"
-        "      WHERE i.hash=c.hash AND m.is_backup=1) AS bcopies,"
-        "    (SELECT COUNT(DISTINCT i2.medium_id) FROM instances i2"
-        "      WHERE i2.hash=c.hash) AS copies,"
-        "    (SELECT i3.path FROM instances i3 WHERE i3.hash=c.hash LIMIT 1)"
-        "      AS example_path"
-        "  FROM content c"
-        ") WHERE bcopies < ?"
-        " ORDER BY bcopies, size DESC LIMIT ?",
+        "SELECT hash, size, backup_copies, copies, example_path FROM content"
+        " WHERE backup_copies < ?"
+        " ORDER BY backup_copies, size DESC LIMIT ?",
         (args.min_copies, args.limit)).fetchall()
     if not rows:
         print(f"OK: everything has at least {args.min_copies}"
               f" backup cop{'y' if args.min_copies==1 else 'ies'}.")
         return
     total = conn.execute(
-        "SELECT COUNT(*) FROM content c WHERE"
-        "  (SELECT COUNT(DISTINCT i.medium_id) FROM instances i"
-        "    JOIN media m ON m.medium_id=i.medium_id"
-        "    WHERE i.hash=c.hash AND m.is_backup=1) < ?",
-        (args.min_copies,)).fetchone()[0]
+        "SELECT COALESCE(SUM(content_count), 0) FROM backup_histogram"
+        " WHERE backup_copies < ?", (args.min_copies,)).fetchone()[0]
     print(f"{total} content objects below {args.min_copies} backup copies"
           f" (showing up to {args.limit}, largest first):")
     print(f"{'BK':>2} {'ALL':>3} {'SIZE':>10}  EXAMPLE PATH")
@@ -430,20 +789,17 @@ def cmd_diff(conn, args):
 
 def cmd_only_on(conn, args):
     """Content whose ONLY copies are on the given medium — the danger list."""
+    # copies=1 means exactly one medium holds it; combined with an instance
+    # on this medium, that medium is this one. Driven from content so the
+    # cost is the size of the singleton set, not the size of the medium.
     rows = conn.execute(
-        "SELECT i.path, c.size FROM instances i JOIN content c ON c.hash=i.hash"
-        " WHERE i.medium_id=? AND NOT EXISTS"
-        "   (SELECT 1 FROM instances i2 WHERE i2.hash=i.hash"
-        "     AND i2.medium_id<>?)"
-        " ORDER BY c.size DESC LIMIT ?",
-        (args.medium_id, args.medium_id, args.limit)).fetchall()
+        "SELECT path, size FROM instances"
+        " WHERE medium_id=? AND only_here=1"
+        " ORDER BY size DESC LIMIT ?",
+        (args.medium_id, args.limit)).fetchall()
     total, tbytes = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(c.size),0) FROM instances i"
-        " JOIN content c ON c.hash=i.hash"
-        " WHERE i.medium_id=? AND NOT EXISTS"
-        "   (SELECT 1 FROM instances i2 WHERE i2.hash=i.hash"
-        "     AND i2.medium_id<>?)",
-        (args.medium_id, args.medium_id)).fetchone()
+        "SELECT only_here_count, only_here_bytes FROM media WHERE medium_id=?",
+        (args.medium_id,)).fetchone() or (0, 0)
     print(f"{total} files ({human_size(tbytes)}) exist ONLY on"
           f" '{args.medium_id}':")
     for path, size in rows:
@@ -451,9 +807,10 @@ def cmd_only_on(conn, args):
 
 
 def cmd_stats(conn, args):
-    n_content, t_bytes = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(size),0) FROM content").fetchone()
-    n_inst = conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0]
+    row = conn.execute(
+        "SELECT content_count, content_bytes, instance_count"
+        " FROM catalog_summary WHERE id=1").fetchone()
+    n_content, t_bytes, n_inst = row or (0, 0, 0)
     n_media = conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]
     dup = n_inst - n_content if n_content else 0
     print(f"media: {n_media}   unique content: {n_content}"
@@ -475,15 +832,12 @@ def cmd_project_ontodag(conn, args):
     """
     to_stdout = args.out == "-"
     out = sys.stdout if to_stdout else open(args.out, "w")
+    # One grouped pass for the medium list; the rest is already materialised.
     rows = conn.execute(
-        "SELECT c.hash,"
-        "  (SELECT GROUP_CONCAT(DISTINCT i.medium_id) FROM instances i"
-        "    WHERE i.hash=c.hash),"
-        "  (SELECT COUNT(DISTINCT i2.medium_id) FROM instances i2"
-        "    JOIN media m ON m.medium_id=i2.medium_id"
-        "    WHERE i2.hash=c.hash AND m.is_backup=1),"
-        "  (SELECT i3.path FROM instances i3 WHERE i3.hash=c.hash LIMIT 1)"
-        " FROM content c").fetchall()
+        "SELECT c.hash, GROUP_CONCAT(DISTINCT i.medium_id),"
+        "       c.backup_copies, c.example_path"
+        " FROM content c LEFT JOIN instances i ON i.hash=c.hash"
+        " GROUP BY c.hash, c.backup_copies, c.example_path").fetchall()
     n = 0
     try:
         for h, media_csv, bcopies, path in rows:
@@ -513,14 +867,15 @@ def human_size(n) -> str:
 # CLI wiring
 # --------------------------------------------------------------------------
 
-def main(argv=None):
+def build_parser():
     p = argparse.ArgumentParser(
         prog="holdings",
         description="Catalog of which media hold which files."
                     " Placement truth in SQLite; semantics belong to OntoDAG.")
     p.add_argument("--db", default=DEFAULT_DB,
-                   help=f"catalog database (default {DEFAULT_DB};"
-                        f" put it in a Syncthing folder to read it everywhere)")
+                   help=f"catalog database (default {DEFAULT_DB}); a path,"
+                        f" or a published read-only catalog as a"
+                        f" bzz://|bzzf:// URL (needs holdings[swarm])")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("add-medium", help="register a medium")
@@ -532,10 +887,10 @@ def main(argv=None):
     s.add_argument("--backup", action="store_true",
                    help="counts toward backup redundancy")
     s.add_argument("--notes")
-    s.set_defaults(func=cmd_add_medium)
+    s.set_defaults(func=cmd_add_medium, writes=True)
 
     s = sub.add_parser("media", help="list media")
-    s.set_defaults(func=cmd_media)
+    s.set_defaults(func=cmd_media, writes=False)
 
     s = sub.add_parser("scan", help="scan a mounted medium (or subtree)")
     s.add_argument("medium_id")
@@ -544,44 +899,52 @@ def main(argv=None):
     s.add_argument("--exclude-file", help="extra exclude patterns, one per line")
     s.add_argument("--full", action="store_true",
                    help="rehash everything (ignore mtime+size shortcut)")
-    s.set_defaults(func=cmd_scan)
+    s.set_defaults(func=cmd_scan, writes=True)
 
     s = sub.add_parser("import-restic",
                        help="ingest `restic ls --json` output ('-' = stdin)")
     s.add_argument("medium_id")
     s.add_argument("listing")
-    s.set_defaults(func=cmd_import_restic)
+    s.set_defaults(func=cmd_import_restic, writes=True)
 
     s = sub.add_parser("whereis", help="which media hold this file?")
     s.add_argument("target", help="path, filename, or sha256:... hash")
-    s.set_defaults(func=cmd_whereis)
+    s.set_defaults(func=cmd_whereis, writes=False)
 
     s = sub.add_parser("redundancy", help="content below N backup copies")
     s.add_argument("--min-copies", type=int, default=2)
     s.add_argument("--limit", type=int, default=40)
-    s.set_defaults(func=cmd_redundancy)
+    s.set_defaults(func=cmd_redundancy, writes=False)
 
     s = sub.add_parser("diff", help="on A but not on B")
     s.add_argument("medium_a")
     s.add_argument("medium_b")
     s.add_argument("--limit", type=int, default=40)
-    s.set_defaults(func=cmd_diff)
+    s.set_defaults(func=cmd_diff, writes=False)
 
     s = sub.add_parser("only-on", help="content that exists ONLY on this medium")
     s.add_argument("medium_id")
     s.add_argument("--limit", type=int, default=40)
-    s.set_defaults(func=cmd_only_on)
+    s.set_defaults(func=cmd_only_on, writes=False)
 
     s = sub.add_parser("stats", help="catalog totals")
-    s.set_defaults(func=cmd_stats)
+    s.set_defaults(func=cmd_stats, writes=False)
+
+    s = sub.add_parser("check",
+                       help="verify derived columns against the base tables")
+    s.set_defaults(func=cmd_check, writes=False)
 
     s = sub.add_parser("project-ontodag",
                        help="emit sys: placement projection (JSON lines)")
     s.add_argument("--out", default="-")
-    s.set_defaults(func=cmd_project_ontodag)
+    s.set_defaults(func=cmd_project_ontodag, writes=False)
 
-    args = p.parse_args(argv)
-    conn = db_connect(args.db)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    conn = open_catalog(args.db, writes=args.writes, cmd=args.cmd)
     try:
         args.func(conn, args)
     finally:

@@ -290,7 +290,11 @@ def test_resolve_by_exact_path_and_by_basename(run, db, tmp_path):
 
 
 def test_ambiguous_basename_refuses_to_guess(run, db, tmp_path):
-    """Two different files, same name: the tool must not pick one."""
+    """Two different files, same name: the tool must not pick one.
+
+    Since the basename lookup moved onto `instances.name`, this also pins
+    that the index did not cost the ambiguity check.
+    """
     root = tmp_path / "disk"
     write(root / "one" / "notes.txt", "first")
     write(root / "two" / "notes.txt", "second")
@@ -536,3 +540,487 @@ def test_human_size(n, expected):
 def test_human_size_keeps_bytes_whole_and_scales_with_one_decimal():
     assert holdings.human_size(1023) == "1023B"      # no decimal below 1 KB
     assert holdings.human_size(1024) == "1.0KB"      # one decimal above
+
+
+# --------------------------------------------------- published catalogs (opt)
+
+# The optional read path: a catalog published read-only and opened by URL.
+# What holdings owns here is the dispatch — which paths are URLs, which
+# commands may run against one, and what someone without the extra is told.
+# The reader itself is swarmlite's.
+
+def fake_swarmlite(monkeypatch, db_path):
+    """Stand in for the extra, so the dispatch is testable without it.
+
+    `connect` returns a genuinely read-only sqlite3 connection over the
+    local file, which is the contract holdings relies on, and records the
+    URL it was asked for.
+    """
+    import types
+    seen = {}
+
+    def connect(url, **kwargs):
+        seen["url"] = url
+        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+    monkeypatch.setitem(sys.modules, "swarmlite",
+                        types.SimpleNamespace(connect=connect))
+    return seen
+
+
+def no_swarmlite(monkeypatch):
+    """Simulate the extra not being installed, whether or not it is."""
+    import builtins
+    real = builtins.__import__
+
+    def fake(name, *a, **k):
+        if name == "swarmlite":
+            raise ModuleNotFoundError("No module named 'swarmlite'",
+                                      name="swarmlite")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake)
+
+
+@pytest.mark.parametrize("db,remote", [
+    ("bzz://abc/catalog.sqlite", True),
+    ("bzzf://owner/topic/catalog.sqlite", True),
+    ("file:///srv/catalog.sqlite", True),
+    ("memory://catalog.sqlite", True),
+    ("/home/peter/catalog.sqlite", False),
+    ("catalog.sqlite", False),
+    ("./bzz/catalog.sqlite", False),        # a directory named bzz is a path
+    ("~/Sync/catalog/catalog.sqlite", False),
+])
+def test_only_url_forms_are_treated_as_published_catalogs(db, remote):
+    assert holdings.is_remote_url(db) is remote
+
+
+def test_every_command_declares_whether_it_writes():
+    """A new subcommand must say which side of the line it is on.
+
+    Without this, one added later inherits no `writes` default and fails at
+    dispatch — or worse, is quietly allowed to write to a read-only catalog.
+    """
+    import argparse
+    p = holdings.build_parser()
+    [subs] = [a for a in p._actions
+              if isinstance(a, argparse._SubParsersAction)]
+    undeclared = [name for name, sp in subs.choices.items()
+                  if sp.get_default("writes") is None]
+    assert not undeclared, f"commands not declaring writes=: {undeclared}"
+
+
+def test_the_commands_that_write_are_the_ones_that_change_placement():
+    """Pins the split itself, so a read command cannot silently become one
+    that writes (which would then be refused against a published catalog)."""
+    import argparse
+    [subs] = [a for a in holdings.build_parser()._actions
+              if isinstance(a, argparse._SubParsersAction)]
+    writers = {n for n, sp in subs.choices.items() if sp.get_default("writes")}
+    assert writers == {"add-medium", "scan", "import-restic"}
+
+
+@pytest.mark.parametrize("argv", [
+    ["add-medium", "d", "--kind", "drive"],
+    ["scan", "d", "/tmp"],
+    ["import-restic", "r", "-"],
+])
+def test_writing_commands_refuse_a_published_catalog(argv, capsys, monkeypatch):
+    """Published catalogs are read-only; the error points at the real route."""
+    fake_swarmlite(monkeypatch, "/nonexistent.sqlite")
+    with pytest.raises(SystemExit) as e:
+        holdings.main(["--db", "bzzf://owner/holdings/catalog.sqlite", *argv])
+    msg = str(e.value)
+    assert "read-only" in msg and "swarmlite publish" in msg
+
+
+def test_reading_a_published_catalog_without_the_extra_says_how_to_install(
+        monkeypatch):
+    no_swarmlite(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        holdings.main(["--db", "bzz://deadbeef/catalog.sqlite", "stats"])
+    assert "holdings[swarm]" in str(e.value)
+
+
+def test_a_local_catalog_never_imports_the_extra(run, monkeypatch, tmp_path):
+    """The contract: stdlib only unless you explicitly ask for a URL."""
+    no_swarmlite(monkeypatch)
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    run("stats")            # would raise if the extra were on the local path
+
+
+def test_read_commands_work_against_a_published_catalog(db, run, monkeypatch,
+                                                        tmp_path, capsys):
+    """The catalog is built locally, then read back through the URL path."""
+    root = tmp_path / "disk"
+    write(root / "holiday.jpg", "photo")
+    run("add-medium", "drive-budapest", "--kind", "drive", "--backup")
+    run("scan", "drive-budapest", str(root))
+    capsys.readouterr()
+
+    url = "bzzf://owner/holdings/catalog.sqlite"
+    seen = fake_swarmlite(monkeypatch, db)
+    holdings.main(["--db", url, "whereis", "holiday.jpg"])
+    out = capsys.readouterr().out
+    assert seen["url"] == url          # dispatched, not opened as a path
+    assert "drive-budapest" in out
+
+
+def test_file_url_over_a_live_catalog_warns_that_the_wal_is_invisible(
+        db, run, monkeypatch, tmp_path, capsys):
+    """Measured against real swarmlite: its read-only VFS reports the WAL
+    absent, so an un-checkpointed write is silently missing. Right for a
+    published artifact (publishing checkpoints first), wrong to pass on in
+    silence for a `file://` read of a live catalog."""
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    Path(db + "-wal").write_bytes(b"\x00" * 64)     # a writer's sidecar
+    capsys.readouterr()
+
+    fake_swarmlite(monkeypatch, db)
+    holdings.main(["--db", f"file://{db}", "stats"])
+    assert "WAL are invisible" in capsys.readouterr().err
+
+
+def test_no_wal_warning_when_there_is_nothing_uncheckpointed(
+        db, run, monkeypatch, tmp_path, capsys):
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    capsys.readouterr()
+
+    fake_swarmlite(monkeypatch, db)
+    holdings.main(["--db", f"file://{db}", "stats"])
+    assert capsys.readouterr().err == ""
+
+
+# ------------------------------------------------------- basename lookups
+
+OLD_INSTANCES = """
+CREATE TABLE media (medium_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+    location_hint TEXT, is_backup INTEGER NOT NULL DEFAULT 0, notes TEXT,
+    last_scanned REAL);
+CREATE TABLE content (hash TEXT PRIMARY KEY, size INTEGER NOT NULL,
+    first_seen REAL NOT NULL);
+CREATE TABLE instances (medium_id TEXT NOT NULL, path TEXT NOT NULL,
+    hash TEXT NOT NULL, size INTEGER NOT NULL, mtime REAL,
+    seen_at REAL NOT NULL, PRIMARY KEY (medium_id, path));
+"""
+
+
+def test_basename_of_a_stored_path():
+    assert holdings.basename("archive/2019/holiday.jpg") == "holiday.jpg"
+    assert holdings.basename("holiday.jpg") == "holiday.jpg"
+    assert holdings.basename("a/b/") == ""
+
+
+def test_whereis_by_bare_filename_uses_the_name_index(db, run, tmp_path):
+    """The lookup `whereis holiday.jpg` performs — the README's own example.
+
+    It used to be `path LIKE '%/name'`, which a leading wildcard makes
+    unservable by any index: measured at 8 minutes unfinished over the
+    network on a 125 MB catalog.
+
+    Asserted at a size where the index is genuinely the cheaper plan. On a
+    handful of rows a scan is cheaper and SQLite rightly picks one, so a
+    plan assertion on a tiny catalog would be testing the planner's
+    arithmetic rather than this schema.
+    """
+    write(tmp_path / "disk" / "deep" / "holiday.jpg", "photo")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    with sqlite3.connect(db) as c:
+        c.executemany(
+            "INSERT INTO instances"
+            " (medium_id, path, name, hash, size, seen_at)"
+            " VALUES ('d', ?, ?, 'sha256:aa', 1, 0)",
+            [(f"bulk/{i}/f{i}.txt", f"f{i}.txt") for i in range(2000)])
+        c.execute("ANALYZE")
+        plan = c.execute("EXPLAIN QUERY PLAN SELECT DISTINCT hash FROM"
+                         " instances WHERE name=? LIMIT 2", ("x",)).fetchall()
+    assert "idx_instances_name" in plan[0][-1], plan
+
+
+def test_same_name_same_content_is_not_ambiguous(run, capsys, tmp_path):
+    write(tmp_path / "disk" / "a" / "notes.txt", "same")
+    write(tmp_path / "disk" / "b" / "notes.txt", "same")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    capsys.readouterr()
+    run("whereis", "notes.txt")                 # one hash, two placements
+    assert "present on 1 media" in capsys.readouterr().out
+
+
+def test_an_older_catalog_is_migrated_in_place_not_discarded(tmp_path, capsys):
+    """A catalog holds facts about media that cannot be rescanned on demand —
+    a drive in a safe in another country — so migration is additive."""
+    db = str(tmp_path / "old.sqlite")
+    old = sqlite3.connect(db)
+    old.executescript(OLD_INSTANCES)
+    old.execute("INSERT INTO media (medium_id, kind, is_backup)"
+                " VALUES ('drive-budapest','drive',1)")
+    old.execute("INSERT INTO content VALUES ('sha256:aa', 10, 0)")
+    old.execute("INSERT INTO instances (medium_id, path, hash, size, seen_at)"
+                " VALUES ('drive-budapest','archive/2019/holiday.jpg',"
+                "'sha256:aa',10,0)")
+    old.commit()
+    old.close()
+
+    conn = holdings.db_connect(db)              # migrates on open
+    assert conn.execute("SELECT name FROM instances").fetchone()[0] \
+        == "holiday.jpg"
+    # and the irreplaceable part is still there
+    assert conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0] == 1
+    conn.close()
+
+    holdings.main(["--db", db, "whereis", "holiday.jpg"])
+    assert "drive-budapest" in capsys.readouterr().out
+
+
+def test_migration_is_idempotent(tmp_path):
+    db = str(tmp_path / "old.sqlite")
+    c = sqlite3.connect(db)
+    c.executescript(OLD_INSTANCES)
+    c.commit()
+    c.close()
+    for _ in range(3):                          # opening repeatedly is safe
+        holdings.db_connect(db).close()
+    conn = sqlite3.connect(db)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(instances)")]
+    assert cols.count("name") == 1
+
+
+# ----------------------------------------------------------- derived state
+
+# `instances.name` is a cache over `instances.path`. These pin that it cannot
+# drift unnoticed, because the columns it will grow in future answer "do I
+# have a backup of this?" and a stale yes is the answer that gets a drive
+# wiped.
+
+def test_check_reports_a_consistent_catalog(run, capsys, tmp_path):
+    write(tmp_path / "disk" / "sub" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    capsys.readouterr()
+    run("check")
+    assert "consistent" in capsys.readouterr().out
+
+
+def test_check_detects_drift_and_does_not_pretend_otherwise(run, db, capsys,
+                                                            tmp_path):
+    write(tmp_path / "disk" / "sub" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    with sqlite3.connect(db) as c:                  # corrupt the cache
+        c.execute("UPDATE instances SET name='wrong.txt'")
+    with pytest.raises(SystemExit) as e:
+        run("check")
+    assert "cache" in str(e.value)
+    assert "DRIFT" in capsys.readouterr().err
+
+
+def test_check_is_read_only_so_it_works_on_a_published_catalog():
+    import argparse
+    [subs] = [a for a in holdings.build_parser()._actions
+              if isinstance(a, argparse._SubParsersAction)]
+    assert subs.choices["check"].get_default("writes") is False
+
+
+def test_derived_state_survives_an_arbitrary_sequence_of_writes(
+        db, run, tmp_path, capsys):
+    """The property that matters: after any mix of write commands, stored
+    derived state equals a fresh recomputation."""
+    import random
+    random.seed(11)
+    root = tmp_path / "disk"
+    run("add-medium", "d", "--kind", "drive")
+    run("add-medium", "e", "--kind", "drive", "--backup")
+
+    for step in range(12):
+        action = random.choice(["add", "rename", "delete", "rescan", "medium"])
+        if action == "add":
+            depth = random.randint(0, 3)
+            d = root.joinpath(*[f"lvl{i}" for i in range(depth)])
+            write(d / f"f{step}.txt", f"content-{step}")
+        elif action == "rename":
+            files = sorted(root.rglob("*.txt"))
+            if files:
+                f = random.choice(files)
+                f.rename(f.with_name(f"renamed{step}.txt"))
+        elif action == "delete":
+            files = sorted(root.rglob("*.txt"))
+            if files:
+                random.choice(files).unlink()
+        elif action == "medium":
+            run("add-medium", random.choice("de"), "--kind", "drive",
+                "--backup")
+        root.mkdir(parents=True, exist_ok=True)
+        run("scan", random.choice("de"), str(root))
+        capsys.readouterr()
+
+        # A raw connection on purpose: db_connect() migrates, which
+        # backfills NULL names and would repair a writer bug before the
+        # assertion could see it.
+        conn = sqlite3.connect(db)
+        try:
+            assert holdings.derived_drift(conn) == [], f"drift at step {step}"
+        finally:
+            conn.close()
+
+
+def test_import_restic_also_keeps_derived_state_consistent(db, run, tmp_path,
+                                                           capsys):
+    listing = tmp_path / "ls.json"
+    listing.write_text("\n".join([
+        json.dumps({"struct_type": "node", "type": "file",
+                    "path": "/deep/nested/report.pdf", "size": 120}),
+        json.dumps({"struct_type": "node", "type": "file",
+                    "path": "/top.txt", "size": 4}),
+    ]))
+    run("add-medium", "r", "--kind", "restic-repo", "--backup")
+    run("import-restic", "r", str(listing))
+    capsys.readouterr()
+    conn = sqlite3.connect(db)          # raw: see what the writer wrote
+    try:
+        assert holdings.derived_drift(conn) == []
+        names = {r[0] for r in conn.execute("SELECT name FROM instances")}
+        assert names == {"report.pdf", "top.txt"}
+    finally:
+        conn.close()
+
+
+# --------------------------------------------- materialised copy counts
+
+def test_flipping_backup_on_a_medium_updates_every_copy_count(run, db, capsys,
+                                                              tmp_path):
+    """The reason refresh runs after add-medium and not only after scan:
+    one flag on one medium changes backup_copies for everything on it."""
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")          # not a backup yet
+    run("scan", "d", str(tmp_path / "disk"))
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT backup_copies FROM content").fetchone()[0] == 0
+
+    run("add-medium", "d", "--kind", "drive", "--backup")
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT backup_copies FROM content").fetchone()[0] == 1
+    capsys.readouterr()
+    run("redundancy", "--min-copies", "1")
+    assert "OK" in capsys.readouterr().out
+
+
+def test_re_adding_a_medium_does_not_lose_its_totals(run, db, tmp_path,
+                                                     capsys):
+    """add-medium is INSERT OR REPLACE, which blanks the derived columns on
+    the row; the refresh afterwards has to put them back."""
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    run("add-medium", "d", "--kind", "drive", "--location", "moved house")
+    capsys.readouterr()
+    run("media")
+    out = capsys.readouterr().out
+    assert "moved house" in out
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT file_count FROM media").fetchone()[0] == 1
+        assert holdings.derived_drift(c) == []
+
+
+def test_only_on_still_finds_content_held_nowhere_else(run, capsys, tmp_path):
+    """Behaviour pinned across the rewrite onto content.copies."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    write(a / "shared.txt", "shared")
+    write(b / "shared.txt", "shared")
+    write(a / "only-here.txt", "unique")
+    run("add-medium", "a", "--kind", "drive")
+    run("add-medium", "b", "--kind", "drive")
+    run("scan", "a", str(a))
+    run("scan", "b", str(b))
+    capsys.readouterr()
+    run("only-on", "a")
+    out = capsys.readouterr().out
+    assert "only-here.txt" in out and "shared.txt" not in out
+    assert out.startswith("1 files")
+
+
+def test_stale_copy_counts_are_reported_not_trusted(run, db, tmp_path,
+                                                    capsys):
+    """The dangerous direction: stored counts claiming backups that the base
+    tables do not support."""
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE content SET backup_copies=3, copies=3")
+    with pytest.raises(SystemExit):
+        run("check")
+    assert "stale" in capsys.readouterr().err
+
+
+def test_an_old_catalog_gets_counts_not_silent_zeroes(tmp_path, capsys):
+    """Migration must refresh, not just add columns.
+
+    A NOT NULL DEFAULT 0 column reads as "no backup copies anywhere", which
+    would make `redundancy` denounce a perfectly backed-up catalog — and
+    `only-on` is the list people wipe drives from.
+    """
+    db = str(tmp_path / "old.sqlite")
+    old = sqlite3.connect(db)
+    old.executescript(OLD_INSTANCES)
+    old.execute("INSERT INTO media (medium_id, kind, is_backup)"
+                " VALUES ('drive-budapest','drive',1)")
+    old.execute("INSERT INTO content VALUES ('sha256:aa', 10, 0)")
+    old.execute("INSERT INTO instances (medium_id, path, hash, size, seen_at)"
+                " VALUES ('drive-budapest','holiday.jpg','sha256:aa',10,0)")
+    old.commit()
+    old.close()
+
+    conn = holdings.db_connect(db)
+    try:
+        assert conn.execute(
+            "SELECT copies, backup_copies, example_path FROM content"
+        ).fetchone() == (1, 1, "holiday.jpg")
+        assert holdings.derived_drift(conn) == []
+    finally:
+        conn.close()
+
+    holdings.main(["--db", db, "redundancy", "--min-copies", "1"])
+    assert "OK" in capsys.readouterr().out
+
+
+def test_only_here_flag_follows_content_becoming_redundant(run, db, capsys,
+                                                           tmp_path):
+    """`only-on` is the list people wipe drives from, so the flag that drives
+    it has to clear the moment a second copy appears."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    write(a / "precious.txt", "precious")
+    run("add-medium", "a", "--kind", "drive")
+    run("add-medium", "b", "--kind", "drive")
+    run("scan", "a", str(a))
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT only_here FROM instances").fetchone()[0] == 1
+
+    write(b / "precious.txt", "precious")        # now held twice
+    run("scan", "b", str(b))
+    with sqlite3.connect(db) as c:
+        assert [r[0] for r in c.execute("SELECT only_here FROM instances")] \
+            == [0, 0]
+        assert holdings.derived_drift(c) == []
+    capsys.readouterr()
+    run("only-on", "a")
+    assert capsys.readouterr().out.startswith("0 files")
+
+
+def test_only_here_drift_is_detected(run, db, capsys, tmp_path):
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE instances SET only_here=0")   # hides the danger
+    with pytest.raises(SystemExit):
+        run("check")
+    assert "only_here" in capsys.readouterr().err

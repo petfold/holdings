@@ -8,6 +8,12 @@ The design contract this all sits under is in the
 authority, everything regenerable by re-scanning, content hash is identity,
 single writer and many readers. Nothing here overrides it.
 
+One clarification that shapes several items below: **how the catalog file
+travels is not part of the contract.** A synced folder and a published
+read-only copy are both valid, neither is required, and the local file is
+authoritative either way. Where Syncthing appears as a *placement source*
+(v0.2) that is a different role and unaffected by the choice.
+
 ---
 
 ## v0.1 — the placement catalog
@@ -25,7 +31,8 @@ Goal: answer "which media hold which files?" from a single stdlib-only script.
 ## v0.2 — Syncthing REST adapter
 
 - [ ] Read placement from Syncthing's REST API rather than inferring it from
-      a scan of the synced directory.
+      a scan of the synced directory. (Syncthing as a source of facts about
+      where files are — independent of what carries the catalog.)
 
 ## v0.3 — OntoDAG join live
 
@@ -44,6 +51,91 @@ Goal: answer "which media hold which files?" from a single stdlib-only script.
 
 - [ ] WASM/PWA read-only viewer, reading the synced SQLite file directly so a
       phone needs no server.
+
+---
+
+## Optional track — publishing the catalog read-only
+
+Orthogonal to the version line above: nothing here gates a version, and
+`pip install holdings` stays stdlib-only and complete without any of it.
+The point is reach — a phone or a second laptop answering `whereis` against
+a catalog published from a machine that has been shut for a week, holding
+no copy of the file and paired with nothing. That is the one thing a synced
+folder structurally cannot do, because Syncthing needs overlapping uptime.
+
+- [x] **Optional read path** (DONE 2026-09-16): `--db bzz://…` / `bzzf://…`
+      opens a published catalog through
+      [swarmlite](https://github.com/petfold/swarmlite), behind the
+      `holdings[swarm]` extra and imported lazily, so a local catalog never
+      touches it. Write commands (`add-medium`, `scan`, `import-restic`)
+      refuse a published catalog and point back at the local file —
+      single-writer is the contract, not a transport limitation.
+- [x] **Every way of naming a file is now an indexed lookup**
+      (DONE 2026-09-16). The primary key is `(medium_id, path)`, so a lookup
+      by path alone scanned every row; a bare filename fell back to
+      `path LIKE '%/name'`, which a leading wildcard makes unservable by any
+      index — and `whereis holiday.jpg` is the README's own headline
+      example. Both were invisible locally and fatal over a network (each
+      failed to finish in 8–9 minutes). Fixed by `idx_instances_path` and by
+      storing the basename in `instances.name` with its own index, migrated
+      in place. Measured on a live node, 130 MB published catalog, whole
+      command, cold: by hash 17 pages (0.05%), by full path 20 pages
+      (0.06%), by bare filename 23 pages (0.07%).
+      Cost: the column and its index add ~12% to the catalog on disk, and
+      backfilling 300k rows took 16s once.
+- [x] **The reports read materialised state instead of scanning**
+      (DONE 2026-09-16). `content.copies` / `.backup_copies` /
+      `.example_path`, `instances.only_here`, per-medium totals on `media`,
+      a one-row `catalog_summary` and a `backup_histogram` for the
+      runtime-threshold count — all recomputed wholesale after every write
+      command (including `add-medium`, since one `--backup` flag changes
+      every count), with `ANALYZE` so the planner has current statistics.
+      Measured on a live node, 157 MB published catalog, whole command,
+      cold: `stats` 4 pages, `media` 4, `redundancy` 56, `only-on` 71 —
+      all four of which previously failed to finish in 8 minutes.
+      Cost: the derived columns and their indexes grew the catalog from
+      113 MB to 157 MB (+39%), and refresh adds a few seconds to a scan.
+- [ ] **`diff A B` is the one report still proportional to its input.** It
+      asks "does B hold this too?" once per file on A, which no
+      precomputation removes. Acceptable locally; expensive over a network.
+      If it ever matters, it wants a per-pair summary rather than a better
+      index.
+- [ ] **Warn on a stale published catalog.** `swarmlite publish` checkpoints
+      WAL into the artifact, so `bzz://` and `bzzf://` are always whole; but
+      a `file://` read of a live catalog silently skips an un-checkpointed
+      WAL (measured: an inserted medium was simply absent). holdings now
+      warns when the sidecar is present — see whether the same class of
+      staleness needs saying for a feed that has not been republished since
+      the last scan.
+- [ ] **Publish-side runbook**: `swarmlite publish --encrypt` after a scan
+      (the catalog carries filenames, sizes and location hints, so the
+      published root is the secret), and `swarmlite stamps --check
+      --min-ttl` on a timer. Expiry is survivable here precisely because the
+      local file is authoritative and the catalog is regenerable — the
+      failure mode is staleness, which the contract already permits.
+- [ ] **Swarm as a *medium*** — a different thing from transport: content
+      published to Swarm counted as a backup copy by `redundancy`. Needs a
+      `sha256 → swarm reference` mapping (a by-product of publishing, so
+      exact, unlike `import-restic`'s basename+size matching) and a notion
+      of a *leased* copy: a postage batch with three weeks left and a drive
+      in a safe are not the same kind of copy, and `--min-copies` cannot say
+      so today.
+
+## Future — the browser
+
+Not scheduled; recorded so it is not re-derived later. OntoDAG is intended
+to run in the browser eventually, and swarmlite has a JS/SQLite-WASM reader,
+so both halves of the placement/semantics join could run client-side against
+published roots with no server — which would also subsume v0.5's phone
+viewer more cheaply than v0.4's localhost UI.
+
+One wrinkle to solve before that is buildable: the projection contract says
+`sys:` memberships are **rebuilt locally on each device** and never synced.
+A browser has no local catalog to rebuild from, and `project-ontodag` is a
+full scan, so an in-browser rebuild would fetch the whole file. The likely
+answer — publishing the projection as a table in the same artifact — is an
+amendment to the contract rather than an implementation detail, so it needs
+agreeing at the meet point (ontodag `docs/plans/PROJECTIONS.md`), not here.
 
 ---
 
