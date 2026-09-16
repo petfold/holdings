@@ -56,6 +56,28 @@ restic -r b2:bucket:repo ls --json latest | ./holdings.py import-restic restic-b
 ./holdings.py check                      # derived columns vs. the base tables
 ```
 
+### Scripting it
+
+Every read command takes `--json` and emits one object, so nothing needs a
+server to consume this — the catalog is a plain SQLite file, and now its
+reports are structured output:
+
+```bash
+./holdings.py stats --json | jq .content
+./holdings.py only-on drive-old --json | jq -r '.items[].path'
+```
+
+`redundancy` and `only-on` also take `--exit-code`, which turns them into
+checks a timer can run:
+
+```bash
+# 3-2-1 policy, enforced rather than merely reported:
+holdings redundancy --min-copies 2 --exit-code || notify-send 'holdings: under-backed'
+
+# the gate to put in front of wiping an old drive:
+holdings only-on drive-old --exit-code || wipe-it
+```
+
 `redundancy` turns your 3-2-1 policy into a checkable report.
 `only-on` is the consolidation to-do list for old scattered drives: run it,
 back those files up via restic, rescan, watch the list empty, then wipe the
@@ -225,7 +247,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **88 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **103 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

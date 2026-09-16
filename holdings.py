@@ -575,6 +575,10 @@ def derived_drift(conn) -> list[str]:
 
 def cmd_check(conn, args):
     problems = derived_drift(conn)
+    if emit_json(args, {"consistent": not problems, "problems": problems}):
+        if problems:
+            raise SystemExit(1)
+        return
     if not problems:
         print("derived state is consistent with the base tables")
         return
@@ -582,6 +586,37 @@ def cmd_check(conn, args):
         print(f"DRIFT: {p}", file=sys.stderr)
     sys.exit("re-run `scan` on the affected media to rebuild derived state"
              " (it is a cache; the base tables are unaffected)")
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+
+def emit_json(args, payload) -> bool:
+    """Print `payload` as one JSON object if --json was asked for.
+
+    The alternative considered was an HTTP API, which would have put a
+    port, a process and a dependency in front of data that is already a
+    plain SQLite file anyone can open. A flag composes with pipes, works
+    over ssh, and needs nothing running.
+    """
+    if not getattr(args, "json", False):
+        return False
+    json.dump(payload, sys.stdout)
+    sys.stdout.write("\n")
+    return True
+
+
+def policy_exit(args, violations: int) -> None:
+    """Exit non-zero when --exit-code was given and the policy is violated.
+
+    The README has called `redundancy` a checkable report since v0.1, but
+    it exited 0 whatever it found, so nothing could actually check it.
+    Same shape as `swarmlite stamps --check --min-ttl`, which the
+    publishing runbook already puts in a cron line.
+    """
+    if getattr(args, "exit_code", False) and violations:
+        raise SystemExit(1)
 
 
 # --------------------------------------------------------------------------
@@ -606,6 +641,11 @@ def cmd_add_medium(conn, args):
 def cmd_media(conn, args):
     rows = conn.execute(
         QUERIES["media"]).fetchall()
+    fields = ("medium_id", "kind", "is_backup", "location_hint",
+              "last_scanned", "file_count", "byte_count",
+              "only_here_count", "only_here_bytes")
+    if emit_json(args, {"media": [dict(zip(fields, r)) for r in rows]}):
+        return
     if not rows:
         print("no media registered yet — use: holdings add-medium <id> --kind drive")
         return
@@ -797,6 +837,15 @@ def cmd_whereis(conn, args):
     size = conn.execute(QUERIES["content_size"], (h,)).fetchone()
     copies = len({r[0] for r in rows})
     backups = len({r[0] for r in rows if r[2]})
+    if emit_json(args, {
+            "hash": h,
+            "size": size[0] if size else None,
+            "copies": copies,
+            "backup_copies": backups,
+            "placements": [
+                dict(zip(("medium_id", "kind", "is_backup", "path",
+                          "seen_at", "location_hint"), r)) for r in rows]}):
+        return
     print(f"{h}  ({human_size(size[0]) if size else '?'})")
     print(f"present on {copies} media ({backups} backup):")
     for mid, kind, bk, path, seen, loc in rows:
@@ -830,17 +879,26 @@ def cmd_redundancy(conn, args):
     """Content with fewer than --min-copies copies on *backup* media."""
     rows = conn.execute(QUERIES["redundancy_rows"],
                         (args.min_copies, args.limit)).fetchall()
+    total = conn.execute(QUERIES["redundancy_total"],
+                         (args.min_copies,)).fetchone()[0]
+    if emit_json(args, {
+            "min_copies": args.min_copies,
+            "below": total,
+            "items": [dict(zip(("hash", "size", "backup_copies", "copies",
+                                "example_path"), r)) for r in rows]}):
+        policy_exit(args, total)
+        return
     if not rows:
         print(f"OK: everything has at least {args.min_copies}"
               f" backup cop{'y' if args.min_copies==1 else 'ies'}.")
+        policy_exit(args, total)
         return
-    total = conn.execute(QUERIES["redundancy_total"],
-                         (args.min_copies,)).fetchone()[0]
     print(f"{total} content objects below {args.min_copies} backup copies"
           f" (showing up to {args.limit}, largest first):")
     print(f"{'BK':>2} {'ALL':>3} {'SIZE':>10}  EXAMPLE PATH")
     for h, size, bcopies, copies, path in rows:
         print(f"{bcopies:>2} {copies:>3} {human_size(size):>10}  {path}")
+    policy_exit(args, total)
 
 
 def cmd_diff(conn, args):
@@ -856,6 +914,11 @@ def cmd_diff(conn, args):
         " WHERE i.medium_id=? AND i.hash NOT IN"
         "   (SELECT hash FROM instances WHERE medium_id=?)",
         (args.medium_a, args.medium_b)).fetchone()
+    if emit_json(args, {
+            "a": args.medium_a, "b": args.medium_b,
+            "files": total, "bytes": tbytes,
+            "items": [{"path": pth, "size": sz} for pth, sz in rows]}):
+        return
     print(f"{total} files ({human_size(tbytes)}) on '{args.medium_a}'"
           f" but not on '{args.medium_b}':")
     for path, size in rows:
@@ -871,10 +934,16 @@ def cmd_only_on(conn, args):
                         (args.medium_id, args.limit)).fetchall()
     total, tbytes = conn.execute(
         QUERIES["only_on_totals"], (args.medium_id,)).fetchone() or (0, 0)
+    if emit_json(args, {
+            "medium_id": args.medium_id, "files": total, "bytes": tbytes,
+            "items": [{"path": pth, "size": sz} for pth, sz in rows]}):
+        policy_exit(args, total)
+        return
     print(f"{total} files ({human_size(tbytes)}) exist ONLY on"
           f" '{args.medium_id}':")
     for path, size in rows:
         print(f"  {human_size(size):>10}  {path}")
+    policy_exit(args, total)
 
 
 def cmd_stats(conn, args):
@@ -882,6 +951,10 @@ def cmd_stats(conn, args):
     n_content, t_bytes, n_inst = row or (0, 0, 0)
     n_media = conn.execute(QUERIES["media_count"]).fetchone()[0]
     dup = n_inst - n_content if n_content else 0
+    if emit_json(args, {"media": n_media, "content": n_content,
+                        "bytes": t_bytes, "instances": n_inst,
+                        "duplicate_placements": dup}):
+        return
     print(f"media: {n_media}   unique content: {n_content}"
           f" ({human_size(t_bytes)})   instances: {n_inst}"
           f"   (dedup would fold {dup} duplicate placements)")
@@ -952,6 +1025,13 @@ def build_parser():
                         " 0 disables)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    def reads(name, **kw):
+        """A read command: every one of them can speak JSON."""
+        sp = sub.add_parser(name, **kw)
+        sp.add_argument("--json", action="store_true",
+                        help="emit one JSON object instead of a report")
+        return sp
+
     s = sub.add_parser("add-medium", help="register a medium")
     s.add_argument("medium_id")
     s.add_argument("--kind", required=True,
@@ -965,7 +1045,7 @@ def build_parser():
     s.add_argument("--notes")
     s.set_defaults(func=cmd_add_medium, writes=True)
 
-    s = sub.add_parser("media", help="list media")
+    s = reads("media", help="list media")
     s.set_defaults(func=cmd_media, writes=False)
 
     s = sub.add_parser("scan", help="scan a mounted medium (or subtree)")
@@ -983,30 +1063,36 @@ def build_parser():
     s.add_argument("listing")
     s.set_defaults(func=cmd_import_restic, writes=True)
 
-    s = sub.add_parser("whereis", help="which media hold this file?")
+    s = reads("whereis", help="which media hold this file?")
     s.add_argument("target", help="path, filename, or sha256:... hash")
     s.set_defaults(func=cmd_whereis, writes=False)
 
-    s = sub.add_parser("redundancy", help="content below N backup copies")
+    s = reads("redundancy", help="content below N backup copies")
     s.add_argument("--min-copies", type=int, default=2)
     s.add_argument("--limit", type=int, default=40)
+    s.add_argument("--exit-code", action="store_true",
+                   help="exit 1 when anything is below --min-copies, so the"
+                        " 3-2-1 policy can be enforced from cron")
     s.set_defaults(func=cmd_redundancy, writes=False)
 
-    s = sub.add_parser("diff", help="on A but not on B")
+    s = reads("diff", help="on A but not on B")
     s.add_argument("medium_a")
     s.add_argument("medium_b")
     s.add_argument("--limit", type=int, default=40)
     s.set_defaults(func=cmd_diff, writes=False)
 
-    s = sub.add_parser("only-on", help="content that exists ONLY on this medium")
+    s = reads("only-on", help="content that exists ONLY on this medium")
     s.add_argument("medium_id")
     s.add_argument("--limit", type=int, default=40)
+    s.add_argument("--exit-code", action="store_true",
+                   help="exit 1 while anything still exists only here --"
+                        " the gate to put in front of wiping the drive")
     s.set_defaults(func=cmd_only_on, writes=False)
 
-    s = sub.add_parser("stats", help="catalog totals")
+    s = reads("stats", help="catalog totals")
     s.set_defaults(func=cmd_stats, writes=False)
 
-    s = sub.add_parser("check",
+    s = reads("check",
                        help="verify derived columns against the base tables")
     s.set_defaults(func=cmd_check, writes=False)
 
