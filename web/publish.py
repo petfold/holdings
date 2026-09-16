@@ -89,26 +89,41 @@ def check_imports(site: Path) -> None:
                  + "\n  ".join(sorted(missing)))
 
 
-def assemble(site: Path, js: Path, args) -> None:
+def copy_page(site: Path, js: Path) -> None:
+    """Put the page, the reader and its vendored engine into `site`.
+
+    Shared with serve.py: publishing and serving locally differ only in
+    where the catalog comes from and who answers the range requests.
+    """
     site.mkdir(parents=True, exist_ok=True)
     shutil.copy(WEB / "index.html", site / "index.html")
     shutil.copy(WEB / "app.js", site / "app.js")
 
-    # Regenerated rather than copied, so a site can never be published with
-    # SQL the CLI has moved on from. (A test guards the committed copy too.)
+    # Regenerated rather than copied, so a site can never be served or
+    # published with SQL the CLI has moved on from. (A test guards the
+    # committed copy too.)
     sys.path.insert(0, str(REPO))
     import holdings
     (site / "queries.json").write_text(
         json.dumps(holdings.QUERIES, indent=2) + "\n")
 
-    (site / "swarmlite").mkdir()
+    (site / "swarmlite").mkdir(exist_ok=True)
     for name in READER_SRC:
         shutil.copy(js / "src" / name, site / "swarmlite" / name)
     # Copied whole, not hand-picked. Curating this list by reading imports
     # is how the first attempt shipped a site missing noble-secp256k1 --
     # which verify.js needs and nothing noticed until the page ran.
-    shutil.copytree(js / "vendor", site / "vendor")
+    if not (site / "vendor").exists():
+        shutil.copytree(js / "vendor", site / "vendor")
 
+
+def write_config(site: Path, config: dict) -> None:
+    (site / "config.json").write_text(json.dumps(config, indent=2) + "\n")
+    check_imports(site)
+
+
+def assemble(site: Path, js: Path, args) -> None:
+    copy_page(site, js)
     config = {
         "name": args.name,
         "label": args.label,
@@ -124,8 +139,7 @@ def assemble(site: Path, js: Path, args) -> None:
         warnings = prepare(args.catalog, str(site / args.name))
         for w in warnings:
             print(f"note: {w}")
-    (site / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    check_imports(site)
+    write_config(site, config)
 
 
 def main() -> int:

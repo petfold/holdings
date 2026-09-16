@@ -283,6 +283,27 @@ There is no write path in the page at all: `add-medium`, `scan` and
 `import-restic` do not exist there, and the publisher does not ship
 swarmlite's JS writer alongside the reader.
 
+### Offline, on this machine
+
+A published catalog is fetched page by page *at query time*, so it needs
+connectivity and a gateway. `web/serve.py` answers the same page from here
+instead — no Bee node, no wallet, no postage batch, and nothing installed
+beyond the stdlib:
+
+```bash
+python web/serve.py --db ~/catalog.sqlite      # http://127.0.0.1:8765/
+```
+
+Which matters for a tool whose job is answering questions about drives you
+are standing in front of with no signal.
+
+It serves a **snapshot**, not the live file. SQLite's WAL sidecar is
+invisible to the reader — measured: a write sitting in the WAL is simply
+absent — so serving the live catalog would read it stale with no warning.
+The snapshot is taken with sqlite3's own backup API, so it is consistent
+even while a scan is writing, and the original is never touched. Re-run to
+pick up a newer scan.
+
 ## Projection contract (OntoDAG integration)
 
 *(2026-08-20: this contract's canonical statement now lives at the meet
@@ -324,7 +345,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **142 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **151 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.
