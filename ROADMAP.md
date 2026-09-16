@@ -68,14 +68,25 @@ premise did not survive the question *who would use the API?*
       `redundancy --min-copies 2 --exit-code` is a cron line, and
       `only-on <drive> --exit-code` is the gate to put in front of wiping
       one — the workflow the README already describes.
-- [ ] **`holdings serve`** — the same `web/` page against a *local*
-      catalog, for offline use and for anyone who does not want a node, a
-      wallet or a postage batch just to get a UI. Stdlib only: the VFS
-      range-fetches from any URL, so the page needs no change; the only
-      missing piece is that `http.server` ignores `Range` and returns the
-      whole file with a 200 (measured), which is a small subclass. Needs
-      swarmlite's JS, which `web/publish.py` copies from a checkout —
-      `serve` wants the same flag, or holdings vendors it.
+- [x] **Serve the viewer locally** (DONE 2026-09-16), as `web/serve.py`
+      rather than a `holdings serve` subcommand. A packaged
+      `pip install holdings` contains neither `web/` nor swarmlite's
+      JavaScript, so a subcommand would have been a promise the install
+      cannot keep; this sits beside `web/publish.py`, which already solves
+      locating the reader the same way. Promoting it to a subcommand is a
+      packaging question, not a code one.
+
+      Stdlib only, including the catalog snapshot (sqlite3's backup API,
+      so it is consistent while a scan writes and never touches the
+      original) — swarmlite's Python package is not needed, only its
+      JavaScript, which is copied as files.
+
+      It serves a snapshot rather than the live file, because the reader
+      cannot see a WAL sidecar and would read a live catalog stale with no
+      warning. The Range handler is the one piece `http.server` does not
+      provide: it ignores `Range` and answers 200 with the whole file, which
+      would make the local case worse than the published one.
+
 - [ ] **A writer's console** — a local UI that can drive `scan`,
       `add-medium` and `import-restic`. Deliberately separate: it would
       break the read-only-by-construction property that currently makes
