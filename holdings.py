@@ -45,7 +45,12 @@ CREATE TABLE IF NOT EXISTS media (
     medium_id     TEXT PRIMARY KEY,          -- e.g. 'drive-budapest', 'laptop-x1', 'restic-b2'
     kind          TEXT NOT NULL,             -- drive | laptop | phone | restic-repo | cloud | other
     location_hint TEXT,                      -- e.g. 'safe, Budapest flat'
-    is_backup     INTEGER NOT NULL DEFAULT 0,-- counts toward redundancy as a backup copy
+    -- Derived from `durability` (and, for a lease, from its expiry) at
+    -- refresh time. Kept as a column because every report joins on it.
+    is_backup     INTEGER NOT NULL DEFAULT 0,
+    durability    TEXT NOT NULL DEFAULT 'working',  -- see DURABILITY
+    lease_expires REAL,                      -- when a leased copy lapses
+    lease_checked REAL,                      -- when that estimate was taken
     notes         TEXT,
     last_scanned  REAL,
     file_count      INTEGER NOT NULL DEFAULT 0, -- derived from instances
@@ -161,6 +166,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     for table, column, decl in [
         ("instances", "name", "TEXT"),
         ("instances", "only_here", "INTEGER NOT NULL DEFAULT 0"),
+        ("media", "durability", "TEXT NOT NULL DEFAULT 'working'"),
+        ("media", "lease_expires", "REAL"),
+        ("media", "lease_checked", "REAL"),
         ("media", "only_here_count", "INTEGER NOT NULL DEFAULT 0"),
         ("media", "only_here_bytes", "INTEGER NOT NULL DEFAULT 0"),
         ("content", "copies", "INTEGER NOT NULL DEFAULT 0"),
@@ -181,6 +189,14 @@ def migrate(conn: sqlite3.Connection) -> None:
             "UPDATE instances SET name=? WHERE medium_id=? AND path=?",
             [(basename(path), mid, path) for mid, path in stale])
     if added:
+        # An existing catalog asserted is_backup by hand. The honest
+        # translation is "independent": it was claimed to survive deletion
+        # of the original, and nothing recorded says otherwise. Anyone who
+        # meant a sync mirror now has to say so -- which is the point.
+        conn.execute("UPDATE media SET durability ="
+                     "  CASE WHEN is_backup THEN 'independent'"
+                     "       ELSE 'working' END"
+                     " WHERE durability = 'working' AND is_backup = 1")
         # The counts default to 0, which would read as "no backups anywhere"
         # until something refreshed them -- so refresh before anyone can ask.
         refresh_derived(conn)
@@ -335,6 +351,60 @@ def sha256_file(path: Path, bufsize: int = 1 << 20) -> str:
 # Excludes
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# What a copy survives
+# --------------------------------------------------------------------------
+
+# `is_backup` used to be asserted by hand, and it answered "is this a backup?"
+# for media that fail in quite different ways. A second drive and a Dropbox
+# folder are both "two places the file is"; only one of them still has the
+# file after you delete the original, because the other propagates the
+# deletion. Since `redundancy --exit-code` turns this into a gate that
+# scripts trust, the distinction has to live in the data.
+#
+# The test each class answers: *if the original is deleted, does this copy
+# survive, and for how long?*
+DURABILITY = {
+    "working":     "the live copy you edit -- not a backup of anything",
+    "independent": "survives deletion of the original; fails only by its own"
+                   " loss (a second drive, a restic repo)",
+    "mirror":      "a sync target: your deletion reaches it (Syncthing,"
+                   " Dropbox, Drive). Protects against losing a device and"
+                   " nothing else",
+    "leased":      "survives deletion, but lapses on a schedule unless"
+                   " renewed (Swarm postage, prepaid storage)",
+    "hosted":      "survives deletion, but someone else decides how long"
+                   " (GitHub, Hugging Face) or whether to keep seeding it"
+                   " (Radicle)",
+}
+
+# Classes whose copies are still there after an `rm` that propagates
+# everywhere it can. A lease is included: it expires, which `redundancy`
+# reports as a separate, time-dependent condition rather than by pretending
+# the copy does not exist.
+COUNTS_AS_BACKUP = ("independent", "leased", "hosted")
+
+# How long a lease must have left before it is treated as a dependable
+# backup copy. A node's TTL is an estimate at the current storage price; if
+# the price rises the batch drains faster than quoted, so the number is an
+# optimistic bound and wants headroom. Matches the runbook's
+# `swarmlite stamps --check --min-ttl`.
+DEFAULT_LEASE_MARGIN_DAYS = 14.0
+
+
+def parse_when(text: str) -> float:
+    """A lease expiry: an ISO date, or a duration from now ('30d', '4w')."""
+    text = text.strip()
+    units = {"h": 3600, "d": 86400, "w": 604800}
+    if text and text[-1] in units and text[:-1].replace(".", "", 1).isdigit():
+        return time.time() + float(text[:-1]) * units[text[-1]]
+    try:
+        return time.mktime(time.strptime(text, "%Y-%m-%d"))
+    except ValueError:
+        raise SystemExit(f"cannot read '{text}' as a date (YYYY-MM-DD) or a"
+                         f" duration from now (e.g. 30d, 4w)")
+
+
 DEFAULT_EXCLUDES = [
     ".cache", ".config", ".git", "node_modules", ".Trash-*", ".stfolder",
     ".stversions", "lost+found", "*.tmp", ".DS_Store",
@@ -375,7 +445,8 @@ def is_excluded(rel_path: str, name: str, patterns: list[str]) -> bool:
 QUERIES = {
     "media":
         "SELECT medium_id, kind, is_backup, location_hint, last_scanned,"
-        "       file_count, byte_count, only_here_count, only_here_bytes"
+        "       file_count, byte_count, only_here_count, only_here_bytes,"
+        "       durability, lease_expires"
         " FROM media ORDER BY medium_id",
     "summary":
         "SELECT content_count, content_bytes, instance_count"
@@ -445,6 +516,37 @@ SELECT c.hash, COALESCE(x.copies, 0), COALESCE(x.backup_copies, 0),
 """
 
 
+_BACKUP_CLASSES_SQL = ", ".join(f"'{c}'" for c in COUNTS_AS_BACKUP)
+
+
+def lease_risks(conn, margin_days: float) -> list[tuple[str, str]]:
+    """Leased media that cannot be relied on as a backup copy right now.
+
+    Time-dependent, so it is computed at read time rather than materialised:
+    a lease lapses with no write happening anywhere, and a stored answer
+    would go quietly wrong between scans.
+    """
+    now = time.time()
+    risks = []
+    for mid, expires, checked in conn.execute(
+            "SELECT medium_id, lease_expires, lease_checked FROM media"
+            " WHERE durability='leased' ORDER BY medium_id"):
+        if expires is None:
+            risks.append((mid, "no expiry recorded"))
+            continue
+        left = (expires - now) / 86400
+        if left <= 0:
+            risks.append((mid, f"lapsed {-left:.0f} days ago"))
+        elif left < margin_days:
+            risks.append((mid, f"{left:.0f} days left"))
+        elif checked is not None and (now - checked) / 86400 > margin_days:
+            # The quote was an estimate at the price of the day; an old one
+            # has had time to be overtaken.
+            risks.append((mid, f"{left:.0f} days left, but that estimate is"
+                               f" {(now - checked) / 86400:.0f} days old"))
+    return risks
+
+
 def refresh_derived(conn) -> None:
     """Recompute every derived column from the base tables.
 
@@ -457,6 +559,12 @@ def refresh_derived(conn) -> None:
     It must run after `add-medium` too, not just after a scan: flipping
     --backup on one medium changes backup_copies for everything on it.
     """
+    # First, because the content counts below are computed from it: what
+    # counts as a backup follows from the medium's class, and is no longer
+    # something anyone asserts directly.
+    conn.execute(
+        "UPDATE media SET is_backup ="
+        f"  CASE WHEN durability IN ({_BACKUP_CLASSES_SQL}) THEN 1 ELSE 0 END")
     # Staged through a temp table rather than UPDATE..FROM, which needs
     # SQLite 3.33 -- newer than `requires-python = ">=3.10"` guarantees.
     conn.execute("DROP TABLE IF EXISTS temp._counts")
@@ -521,6 +629,28 @@ def derived_drift(conn) -> list[str]:
             f"instances.name disagrees with path on {len(wrong)} row(s), "
             f"e.g. {wrong[0]!r}")
 
+    claimed = conn.execute(
+        "SELECT COUNT(*) FROM media WHERE is_backup <>"
+        f"  (CASE WHEN durability IN ({_BACKUP_CLASSES_SQL}) THEN 1 ELSE 0 END)"
+    ).fetchone()[0]
+    if claimed:
+        problems.append(
+            f"media.is_backup disagrees with durability on {claimed} row(s)")
+
+    unknown = [m for m, in conn.execute(
+        "SELECT medium_id FROM media WHERE durability NOT IN ("
+        + ", ".join("?" * len(DURABILITY)) + ")", tuple(DURABILITY))]
+    if unknown:
+        problems.append(f"media with an unknown durability class: {unknown}")
+
+    leaseless = [m for m, in conn.execute(
+        "SELECT medium_id FROM media"
+        " WHERE durability='leased' AND lease_expires IS NULL")]
+    if leaseless:
+        problems.append(
+            f"leased media with no recorded expiry: {leaseless}"
+            " -- they count as backup copies with no end date")
+
     flags = conn.execute(
         "SELECT COUNT(*) FROM instances i LEFT JOIN content c"
         "    ON c.hash = i.hash"
@@ -575,6 +705,10 @@ def derived_drift(conn) -> list[str]:
 
 def cmd_check(conn, args):
     problems = derived_drift(conn)
+    # Not drift -- the catalog is internally consistent -- but the same
+    # question a reader is really asking: can I rely on what this says?
+    problems += [f"leased medium '{m}': {w}"
+                 for m, w in lease_risks(conn, DEFAULT_LEASE_MARGIN_DAYS)]
     if emit_json(args, {"consistent": not problems, "problems": problems}):
         if problems:
             raise SystemExit(1)
@@ -624,18 +758,41 @@ def policy_exit(args, violations: int) -> None:
 # --------------------------------------------------------------------------
 
 def cmd_add_medium(conn, args):
+    durability = args.durability or ("independent" if args.backup
+                                     else "working")
+    known = conn.execute("SELECT lease_expires FROM media WHERE medium_id=?",
+                         (args.medium_id,)).fetchone()
+    if (durability == "leased" and not args.lease_expires
+            and not (known and known[0])):
+        sys.exit("--durability leased needs --lease-expires: a lease with no"
+                 " end date would count as a backup copy forever, which is"
+                 " the one thing a lease is not")
+    if args.lease_expires and durability != "leased":
+        sys.exit(f"--lease-expires applies to --durability leased,"
+                 f" not '{durability}'")
+
+    expires = parse_when(args.lease_expires) if args.lease_expires else None
+    # INSERT OR REPLACE rewrites the whole row, so anything not restated
+    # here has to be carried over: the scan time, and a lease recorded by an
+    # earlier call that this one is not changing.
     conn.execute(
         "INSERT OR REPLACE INTO media"
-        " (medium_id, kind, location_hint, is_backup, notes, last_scanned)"
+        " (medium_id, kind, location_hint, durability, notes, last_scanned,"
+        "  lease_expires, lease_checked)"
         " VALUES (?,?,?,?,?,"
-        "   (SELECT last_scanned FROM media WHERE medium_id=?))",
-        (args.medium_id, args.kind, args.location, int(args.backup),
-         args.notes, args.medium_id),
+        "   (SELECT last_scanned FROM media WHERE medium_id=?),"
+        "   COALESCE(?, (SELECT lease_expires FROM media WHERE medium_id=?)),"
+        "   COALESCE(?, (SELECT lease_checked FROM media WHERE medium_id=?)))",
+        (args.medium_id, args.kind, args.location, durability, args.notes,
+         args.medium_id,
+         expires, args.medium_id,
+         time.time() if expires else None, args.medium_id),
     )
-    refresh_derived(conn)       # --backup here changes every backup_copies
+    refresh_derived(conn)       # the class here changes every backup_copies
     conn.commit()
+    note = DURABILITY[durability].split(" (")[0].split(";")[0].split(" -- ")[0]
     print(f"medium '{args.medium_id}' registered"
-          f" (kind={args.kind}, backup={'yes' if args.backup else 'no'})")
+          f" (kind={args.kind}, durability={durability}: {note})")
 
 
 def cmd_media(conn, args):
@@ -643,17 +800,22 @@ def cmd_media(conn, args):
         QUERIES["media"]).fetchall()
     fields = ("medium_id", "kind", "is_backup", "location_hint",
               "last_scanned", "file_count", "byte_count",
-              "only_here_count", "only_here_bytes")
+              "only_here_count", "only_here_bytes",
+              "durability", "lease_expires")
     if emit_json(args, {"media": [dict(zip(fields, r)) for r in rows]}):
         return
     if not rows:
         print("no media registered yet — use: holdings add-medium <id> --kind drive")
         return
-    print(f"{'MEDIUM':22} {'KIND':12} {'BK':3} {'FILES':>8} {'SIZE':>10}"
-          f" {'LAST SCAN':19}  LOCATION")
-    for mid, kind, bk, loc, ts, nfiles, nbytes, _only_n, _only_b in rows:
+    print(f"{'MEDIUM':22} {'KIND':12} {'SURVIVES':12} {'FILES':>8}"
+          f" {'SIZE':>10} {'LAST SCAN':19}  LOCATION")
+    for (mid, kind, _bk, loc, ts, nfiles, nbytes, _only_n, _only_b,
+         durability, expires) in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "never"
-        print(f"{mid:22} {kind:12} {'y' if bk else '-':3} {nfiles:>8}"
+        shown = durability
+        if durability == "leased" and expires:
+            shown = f"{durability}*" if expires <= time.time() else durability
+        print(f"{mid:22} {kind:12} {shown:12} {nfiles:>8}"
               f" {human_size(nbytes):>10} {when:19}  {loc or ''}")
 
 
@@ -881,24 +1043,34 @@ def cmd_redundancy(conn, args):
                         (args.min_copies, args.limit)).fetchall()
     total = conn.execute(QUERIES["redundancy_total"],
                          (args.min_copies,)).fetchone()[0]
+    # A lease can lapse with no write happening, so the materialised counts
+    # above can be right as of the last scan and wrong now. Checked here,
+    # and counted as a violation: a backup you have stopped paying for is
+    # not a backup, and this is the report that gates other people's cron.
+    risks = lease_risks(conn, args.lease_margin)
+
     if emit_json(args, {
             "min_copies": args.min_copies,
             "below": total,
+            "leases_at_risk": [{"medium_id": m, "status": w}
+                               for m, w in risks],
             "items": [dict(zip(("hash", "size", "backup_copies", "copies",
                                 "example_path"), r)) for r in rows]}):
-        policy_exit(args, total)
+        policy_exit(args, total + len(risks))
         return
+    for mid, why in risks:
+        print(f"AT RISK: leased medium '{mid}' -- {why}", file=sys.stderr)
     if not rows:
         print(f"OK: everything has at least {args.min_copies}"
               f" backup cop{'y' if args.min_copies==1 else 'ies'}.")
-        policy_exit(args, total)
+        policy_exit(args, total + len(risks))
         return
     print(f"{total} content objects below {args.min_copies} backup copies"
           f" (showing up to {args.limit}, largest first):")
     print(f"{'BK':>2} {'ALL':>3} {'SIZE':>10}  EXAMPLE PATH")
     for h, size, bcopies, copies, path in rows:
         print(f"{bcopies:>2} {copies:>3} {human_size(size):>10}  {path}")
-    policy_exit(args, total)
+    policy_exit(args, total + len(risks))
 
 
 def cmd_diff(conn, args):
@@ -1038,10 +1210,15 @@ def build_parser():
                    choices=["drive", "laptop", "phone", "restic-repo",
                             "cloud", "other"])
     s.add_argument("--location", help="where it physically lives")
+    s.add_argument("--durability", choices=sorted(DURABILITY),
+                   help="what this copy survives; "
+                        + "; ".join(f"{k}: {v.split(' (')[0]}"
+                                    for k, v in DURABILITY.items()))
+    s.add_argument("--lease-expires", metavar="WHEN",
+                   help="for --durability leased: YYYY-MM-DD, or a duration"
+                        " from now such as 30d or 4w")
     s.add_argument("--backup", action="store_true",
-                   help="counts toward backup redundancy -- only for media"
-                        " where the copy survives deletion of the original"
-                        " (a sync mirror does not; see the README)")
+                   help="shorthand for --durability independent")
     s.add_argument("--notes")
     s.set_defaults(func=cmd_add_medium, writes=True)
 
@@ -1070,9 +1247,14 @@ def build_parser():
     s = reads("redundancy", help="content below N backup copies")
     s.add_argument("--min-copies", type=int, default=2)
     s.add_argument("--limit", type=int, default=40)
+    s.add_argument("--lease-margin", type=float, metavar="DAYS",
+                   default=DEFAULT_LEASE_MARGIN_DAYS,
+                   help="a leased medium with less than this left is reported"
+                        f" as at risk (default {DEFAULT_LEASE_MARGIN_DAYS:.0f})")
     s.add_argument("--exit-code", action="store_true",
-                   help="exit 1 when anything is below --min-copies, so the"
-                        " 3-2-1 policy can be enforced from cron")
+                   help="exit 1 when anything is below --min-copies or a"
+                        " leased copy is at risk, so the 3-2-1 policy can be"
+                        " enforced from cron")
     s.set_defaults(func=cmd_redundancy, writes=False)
 
     s = reads("diff", help="on A but not on B")

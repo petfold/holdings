@@ -1,5 +1,5 @@
 {
-  "media": "SELECT medium_id, kind, is_backup, location_hint, last_scanned,       file_count, byte_count, only_here_count, only_here_bytes FROM media ORDER BY medium_id",
+  "media": "SELECT medium_id, kind, is_backup, location_hint, last_scanned,       file_count, byte_count, only_here_count, only_here_bytes,       durability, lease_expires FROM media ORDER BY medium_id",
   "summary": "SELECT content_count, content_bytes, instance_count FROM catalog_summary WHERE id=1",
   "media_count": "SELECT COUNT(*) AS n FROM media",
   "resolve_by_path": "SELECT hash FROM instances WHERE path=? LIMIT 1",

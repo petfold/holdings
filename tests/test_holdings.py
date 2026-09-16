@@ -1202,3 +1202,177 @@ def test_check_json_reports_drift(stocked, db, capsys):
         stocked("check", "--json")
     doc = json.loads(capsys.readouterr().out)
     assert doc["consistent"] is False and doc["problems"]
+
+
+# ----------------------------------------------------- durability classes
+
+# The hazard these close: `--exit-code` turned redundancy into a gate that
+# scripts trust, while `--backup` was an unverified claim covering media
+# that fail in quite different ways.
+
+def test_a_sync_mirror_is_not_a_backup_copy(run, db, capsys, tmp_path):
+    """The one that was actively misleading. A Dropbox or Syncthing folder
+    is scannable as an ordinary path, so nothing stopped it being marked
+    --backup — after which redundancy reported two copies of a file that a
+    single rm removes from both."""
+    laptop, mirror = tmp_path / "laptop", tmp_path / "mirror"
+    write(laptop / "photo.jpg", "photo")
+    write(mirror / "photo.jpg", "photo")
+    run("add-medium", "laptop", "--kind", "laptop")
+    run("add-medium", "dropbox", "--kind", "cloud", "--durability", "mirror")
+    run("scan", "laptop", str(laptop))
+    run("scan", "dropbox", str(mirror))
+    capsys.readouterr()
+
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT is_backup FROM media"
+                         " WHERE medium_id='dropbox'").fetchone()[0] == 0
+        assert c.execute("SELECT copies, backup_copies FROM content"
+                         ).fetchone() == (2, 0)
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "1", "--exit-code")
+
+
+def test_an_independent_copy_is_a_backup_copy(run, db, capsys, tmp_path):
+    laptop, drive = tmp_path / "laptop", tmp_path / "drive"
+    write(laptop / "photo.jpg", "photo")
+    write(drive / "photo.jpg", "photo")
+    run("add-medium", "laptop", "--kind", "laptop")
+    run("add-medium", "drive", "--kind", "drive", "--durability", "independent")
+    run("scan", "laptop", str(laptop))
+    run("scan", "drive", str(drive))
+    capsys.readouterr()
+    run("redundancy", "--min-copies", "1", "--exit-code")     # no raise
+
+
+def test_backup_flag_still_means_independent(run, db):
+    """Existing catalogs and existing muscle memory keep working."""
+    run("add-medium", "d", "--kind", "drive", "--backup")
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT durability, is_backup FROM media"
+                         ).fetchone() == ("independent", 1)
+
+
+def test_is_backup_is_derived_not_asserted(run, db, capsys, tmp_path):
+    """Hand-setting the column is drift, not configuration."""
+    run("add-medium", "d", "--kind", "cloud", "--durability", "mirror")
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE media SET is_backup=1")          # the old way
+    with pytest.raises(SystemExit):
+        run("check")
+    assert "disagrees with durability" in capsys.readouterr().err
+
+
+# ------------------------------------------------------------- leases
+
+def test_a_lease_needs_an_end_date(run):
+    with pytest.raises(SystemExit) as e:
+        run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased")
+    assert "forever" in str(e.value)
+
+
+def test_lease_expiry_accepts_a_duration_or_a_date(run, db):
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "30d")
+    with sqlite3.connect(db) as c:
+        expires, checked = c.execute(
+            "SELECT lease_expires, lease_checked FROM media").fetchone()
+    assert 29 < (expires - time.time()) / 86400 < 31
+    assert abs(checked - time.time()) < 60        # the estimate is dated
+
+
+def test_a_healthy_lease_counts_as_a_backup(run, db, capsys, tmp_path):
+    write(tmp_path / "d" / "a.txt", "a")
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "300d")
+    run("scan", "swarm", str(tmp_path / "d"))
+    capsys.readouterr()
+    run("redundancy", "--min-copies", "1", "--exit-code")     # no raise
+
+
+def test_a_lapsed_lease_is_a_policy_violation(run, db, capsys, tmp_path):
+    """A backup you stopped paying for is not a backup — and it lapses with
+    no write happening, so it cannot be caught by the materialised counts."""
+    write(tmp_path / "d" / "a.txt", "a")
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "300d")
+    run("scan", "swarm", str(tmp_path / "d"))
+    with sqlite3.connect(db) as c:                # time passes, nothing writes
+        c.execute("UPDATE media SET lease_expires=?", (time.time() - 86400,))
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        run("redundancy", "--min-copies", "1", "--exit-code")
+    assert e.value.code == 1
+    assert "lapsed" in capsys.readouterr().err
+
+
+def test_a_lease_inside_the_margin_is_at_risk(run, db, capsys, tmp_path):
+    write(tmp_path / "d" / "a.txt", "a")
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "5d")
+    run("scan", "swarm", str(tmp_path / "d"))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "1", "--lease-margin", "14",
+            "--exit-code")
+    assert "5 days left" in capsys.readouterr().err
+    run("redundancy", "--min-copies", "1", "--lease-margin", "1",
+        "--exit-code")                                        # no raise
+
+
+def test_an_old_lease_estimate_is_not_trusted_silently(run, db, capsys,
+                                                       tmp_path):
+    """A node's TTL is an estimate at the price of the day; if the price
+    rises the batch drains faster than quoted."""
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "300d")
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE media SET lease_checked=?",
+                  (time.time() - 200 * 86400,))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("redundancy", "--exit-code")
+    assert "estimate is 200 days old" in capsys.readouterr().err
+
+
+def test_re_registering_a_medium_keeps_its_lease(run, db, capsys):
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "300d")
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--location", "moved")
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT lease_expires FROM media"
+                         ).fetchone()[0] is not None
+
+
+def test_redundancy_json_reports_leases_at_risk(run, db, capsys, tmp_path):
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "1d")
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("redundancy", "--json", "--exit-code")
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["leases_at_risk"][0]["medium_id"] == "swarm"
+
+
+def test_an_old_catalog_keeps_what_it_claimed(tmp_path, capsys):
+    """Migration must not silently downgrade an existing backup: is_backup=1
+    was a claim that the copy survives deletion, which is `independent`."""
+    db = str(tmp_path / "old.sqlite")
+    old = sqlite3.connect(db)
+    old.executescript(OLD_INSTANCES)
+    old.execute("INSERT INTO media (medium_id, kind, is_backup)"
+                " VALUES ('drive-budapest','drive',1)")
+    old.execute("INSERT INTO media (medium_id, kind, is_backup)"
+                " VALUES ('laptop','laptop',0)")
+    old.commit()
+    old.close()
+
+    conn = holdings.db_connect(db)
+    try:
+        assert dict(conn.execute(
+            "SELECT medium_id, durability FROM media")) == {
+                "drive-budapest": "independent", "laptop": "working"}
+        assert holdings.derived_drift(conn) == []
+    finally:
+        conn.close()
