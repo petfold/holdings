@@ -155,6 +155,10 @@ def main() -> int:
                     help="shown in the page header")
     ap.add_argument("--api-url", dest="api_url")
     ap.add_argument("--stamp", default="auto")
+    ap.add_argument("--redundancy", type=int, default=2, choices=range(5),
+                    metavar="0-4",
+                    help="erasure-coding level for the upload (default 2):"
+                         " how much chunk loss the published root survives")
     ap.add_argument("--verify", action="store_true",
                     help="check every chunk against the root client-side"
                          " (for an untrusted gateway)")
@@ -171,7 +175,12 @@ def main() -> int:
         return 0
 
     import fsspec
-    opts = {"stamp": args.stamp}
+    # Erasure level 2, stated rather than inherited. swarmfs defaults to it,
+    # but a silently inherited durability setting is the kind that changes
+    # under you -- and this is the setting that decides whether the site
+    # survives chunk loss. It costs more stamped chunks, which `--buy`
+    # sizing already accounts for.
+    opts = {"stamp": args.stamp, "redundancy": args.redundancy}
     if args.api_url:
         opts["api_url"] = args.api_url
     fs = fsspec.filesystem("bzz", **opts)
