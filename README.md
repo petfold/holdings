@@ -78,6 +78,9 @@ swarmlite publish ~/catalog.sqlite --encrypt --feed holdings --signer $KEY
 holdings --db bzzf://<owner>/holdings/catalog.sqlite whereis holiday.jpg
 ```
 
+The full loop — encryption, feeds, postage renewal, and what to do when a
+batch lapses — is in **[docs/PUBLISHING.md](docs/PUBLISHING.md)**.
+
 [swarmlite](https://github.com/petfold/swarmlite) maps SQLite's 4 KB pages
 onto Swarm range reads, so an indexed lookup fetches a handful of pages
 rather than the catalog — a phone can answer `whereis` against a laptop that
@@ -154,7 +157,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **81 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **86 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

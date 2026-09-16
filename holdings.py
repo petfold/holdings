@@ -271,14 +271,49 @@ def remote_connect(url: str):
     return swarmlite.connect(url)
 
 
-def open_catalog(db: str, *, writes: bool, cmd: str):
+# A synced folder refreshes itself; a published catalog does not. `bzz://`
+# names one immutable version forever, and a `bzzf://` feed only moves when
+# someone republishes -- so a reader can be looking at placement from months
+# ago with nothing on screen to say so.
+DEFAULT_MAX_SCAN_AGE_DAYS = 30.0
+
+
+def warn_if_stale(conn, max_age_days: float) -> None:
+    """Warn when nothing in a published catalog has been scanned recently.
+
+    Deliberately measures scan age, not publication age. The tempting check
+    -- compare the feed's last update against the catalog's newest scan --
+    cannot say anything: a published catalog was written before it was
+    published, so that gap is always small and always reassuring, including
+    when the writer stopped scanning a year ago. What a reader can actually
+    act on is how old the underlying facts are.
+    """
+    if max_age_days <= 0:
+        return
+    newest = conn.execute("SELECT MAX(last_scanned) FROM media").fetchone()[0]
+    if newest is None:
+        return
+    age = (time.time() - newest) / 86400
+    if age < max_age_days:
+        return
+    print(f"warning: nothing in this catalog has been scanned since "
+          f"{time.strftime('%Y-%m-%d', time.localtime(newest))}"
+          f" ({age:.0f} days ago) -- a published catalog is a snapshot and"
+          f" does not refresh itself. Republish after scanning."
+          f" (--max-scan-age 0 silences this.)", file=sys.stderr)
+
+
+def open_catalog(db: str, *, writes: bool, cmd: str,
+                 max_scan_age: float = DEFAULT_MAX_SCAN_AGE_DAYS):
     """Connect to a catalog, local or published, per the `--db` path given."""
     if not is_remote_url(db):
         return db_connect(db)
     if writes:
         sys.exit(f"'{cmd}' writes to the catalog, but '{db}' is published.\n"
                  + _WRITE_ON_PUBLISHED.format(cmd=cmd))
-    return remote_connect(db)
+    conn = remote_connect(db)
+    warn_if_stale(conn, max_scan_age)
+    return conn
 
 
 # --------------------------------------------------------------------------
@@ -876,6 +911,11 @@ def build_parser():
                    help=f"catalog database (default {DEFAULT_DB}); a path,"
                         f" or a published read-only catalog as a"
                         f" bzz://|bzzf:// URL (needs holdings[swarm])")
+    p.add_argument("--max-scan-age", type=float,
+                   default=DEFAULT_MAX_SCAN_AGE_DAYS, metavar="DAYS",
+                   help="warn when a published catalog's newest scan is older"
+                        f" than this (default {DEFAULT_MAX_SCAN_AGE_DAYS:.0f};"
+                        " 0 disables)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("add-medium", help="register a medium")
@@ -944,7 +984,8 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    conn = open_catalog(args.db, writes=args.writes, cmd=args.cmd)
+    conn = open_catalog(args.db, writes=args.writes, cmd=args.cmd,
+                        max_scan_age=args.max_scan_age)
     try:
         args.func(conn, args)
     finally:

@@ -100,26 +100,46 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
       precomputation removes. Acceptable locally; expensive over a network.
       If it ever matters, it wants a per-pair summary rather than a better
       index.
-- [ ] **Warn on a stale published catalog.** `swarmlite publish` checkpoints
-      WAL into the artifact, so `bzz://` and `bzzf://` are always whole; but
-      a `file://` read of a live catalog silently skips an un-checkpointed
-      WAL (measured: an inserted medium was simply absent). holdings now
-      warns when the sidecar is present — see whether the same class of
-      staleness needs saying for a feed that has not been republished since
-      the last scan.
-- [ ] **Publish-side runbook**: `swarmlite publish --encrypt` after a scan
-      (the catalog carries filenames, sizes and location hints, so the
-      published root is the secret), and `swarmlite stamps --check
-      --min-ttl` on a timer. Expiry is survivable here precisely because the
-      local file is authoritative and the catalog is regenerable — the
-      failure mode is staleness, which the contract already permits.
+- [x] **Warn on a stale published catalog** (DONE 2026-09-16). A synced
+      folder refreshes itself; a pin never does and a feed only moves when
+      someone republishes, so a reader can be looking at months-old
+      placement with nothing on screen to say so. Reads of a published
+      catalog now warn when its newest scan is older than `--max-scan-age`
+      (default 30 days). Note this measures *scan* age, not publication
+      age: the obvious check — the feed's last update against the catalog's
+      newest scan — says nothing, because a catalog is always written
+      before it is published, so that gap is small and reassuring even when
+      the writer stopped scanning a year ago. A reader genuinely cannot
+      detect "scanned but not published"; only the writer can, which is why
+      that half lives in the runbook as a habit rather than a check.
+- [x] **Publish-side runbook** (DONE 2026-09-16):
+      [docs/PUBLISHING.md](docs/PUBLISHING.md) — the scan/publish loop, why
+      `--encrypt` is not optional for a file carrying filenames and location
+      hints, feeds versus pins, postage renewal as a cron line, and what a
+      lapsed batch does and does not cost.
 - [ ] **Swarm as a *medium*** — a different thing from transport: content
       published to Swarm counted as a backup copy by `redundancy`. Needs a
-      `sha256 → swarm reference` mapping (a by-product of publishing, so
-      exact, unlike `import-restic`'s basename+size matching) and a notion
-      of a *leased* copy: a postage batch with three weeks left and a drive
-      in a safe are not the same kind of copy, and `--min-copies` cannot say
-      so today.
+      `sha256 → swarm reference` mapping, which is a by-product of
+      publishing and therefore exact, unlike `import-restic`'s
+      basename+size matching.
+
+      The modelling problem is the copy itself. Every other medium fails by
+      **event** — a drive dies, a laptop is stolen. A stamped copy fails by
+      **inaction**, on a schedule, and `--min-copies 2` cannot say that one
+      of two copies evaporates in three weeks. So a leased copy needs:
+
+      * a stored expiry **and** the time the estimate was taken. A node's
+        TTL is derived from the batch balance at the *current* storage
+        price; if the price rises the batch drains faster and expiry
+        arrives sooner than quoted. The figure is an optimistic bound that
+        also goes stale where it sits — "18 days left", recorded four
+        months ago, is an expired lease, not an 18-day one.
+      * a **conservative** reading everywhere it is used: discount the
+        estimate, and treat an estimate older than its own remaining life
+        as expired rather than trusted.
+      * `redundancy` must not count a lease that is about to lapse as a
+        backup copy. Getting this wrong is the failure this tool exists to
+        prevent — `only-on` is the list people wipe drives from.
 
 ## Future — the browser
 
