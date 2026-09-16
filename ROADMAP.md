@@ -43,13 +43,44 @@ Goal: answer "which media hold which files?" from a single stdlib-only script.
 - [ ] Retention-aware redundancy join — the enforcement report as the join of
       `redundancy` / `diff` against the categorisation.
 
-## v0.4 — localhost UI
+## v0.4 — scriptable, and servable offline
 
-- [ ] FastAPI localhost UI over the same database. Worth reconsidering now
-      that v0.5 exists: the browser viewer needs no server and reaches any
-      device, while this reaches only the machine it runs on. Its remaining
-      case is offline use against a local catalog, which the viewer cannot
-      do — reads happen over the network at query time.
+Was "FastAPI localhost UI over the same database". Dropped, because the
+premise did not survive the question *who would use the API?*
+
+- Another program on this machine opens the catalog directly — it is a
+  plain SQLite file. An HTTP server in front of it adds a port, a process
+  and a dependency to reach data that was already open.
+- Remote consumers are served by a published catalog (no server at all,
+  and it answers while the machine is off).
+- The browser viewer talks SQL to the file through its VFS; it never
+  wanted an API, which is why v0.5 shipped without one.
+- Scripts were the one real audience — and a flag serves them better than
+  a server.
+
+- [x] **`--json` on every read command** (DONE 2026-09-16): one object per
+      invocation, composes with `jq`, works over ssh, needs nothing
+      running. A structural test fails if a read command is added without
+      it.
+- [x] **`--exit-code` on `redundancy` and `only-on`** (DONE 2026-09-16).
+      The README has called `redundancy` a checkable report since v0.1,
+      but it exited 0 whatever it found, so nothing could check it. Now
+      `redundancy --min-copies 2 --exit-code` is a cron line, and
+      `only-on <drive> --exit-code` is the gate to put in front of wiping
+      one — the workflow the README already describes.
+- [ ] **`holdings serve`** — the same `web/` page against a *local*
+      catalog, for offline use and for anyone who does not want a node, a
+      wallet or a postage batch just to get a UI. Stdlib only: the VFS
+      range-fetches from any URL, so the page needs no change; the only
+      missing piece is that `http.server` ignores `Range` and returns the
+      whole file with a 200 (measured), which is a small subclass. Needs
+      swarmlite's JS, which `web/publish.py` copies from a checkout —
+      `serve` wants the same flag, or holdings vendors it.
+- [ ] **A writer's console** — a local UI that can drive `scan`,
+      `add-medium` and `import-restic`. Deliberately separate: it would
+      break the read-only-by-construction property that currently makes
+      the viewer safe to hand to anyone, so it is a different product and
+      a different decision.
 
 ## v0.5 — read-only viewer for phones
 

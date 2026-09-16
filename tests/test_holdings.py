@@ -1094,3 +1094,111 @@ def test_an_empty_published_catalog_does_not_warn(db, monkeypatch, capsys):
     fake_swarmlite(monkeypatch, db)
     holdings.main(["--db", "bzzf://o/holdings/c.sqlite", "stats"])
     assert capsys.readouterr().err == ""
+
+
+# ------------------------------------------------- machine-readable output
+
+# The alternative considered was an HTTP API. These pin the flag instead:
+# no port, no process, no dependency in front of a file anyone can open.
+
+READ_COMMANDS = ["media", "whereis", "redundancy", "diff", "only-on",
+                 "stats", "check"]
+
+
+@pytest.fixture
+def stocked(run, tmp_path, capsys):
+    """A catalog with a backed-up file and one held nowhere else."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    write(a / "shared.txt", "shared")
+    write(b / "shared.txt", "shared")
+    write(a / "only-here.txt", "unique")
+    run("add-medium", "a", "--kind", "drive", "--backup")
+    run("add-medium", "b", "--kind", "drive", "--backup")
+    run("scan", "a", str(a))
+    run("scan", "b", str(b))
+    capsys.readouterr()
+    return run
+
+
+def test_every_read_command_can_speak_json():
+    """A command added later must not quietly be the one that cannot."""
+    import argparse
+    [subs] = [a for a in holdings.build_parser()._actions
+              if isinstance(a, argparse._SubParsersAction)]
+    readers = {n for n, sp in subs.choices.items()
+               if sp.get_default("writes") is False}
+    without = {n for n in readers
+               if sp_has_no_json(subs.choices[n])} - {"project-ontodag"}
+    assert not without, f"read commands without --json: {without}"
+
+
+def sp_has_no_json(sp) -> bool:
+    return not any(o == "--json" for a in sp._actions for o in a.option_strings)
+
+
+@pytest.mark.parametrize("argv", [
+    ["media"], ["stats"], ["check"], ["whereis", "shared.txt"],
+    ["redundancy"], ["only-on", "a"], ["diff", "a", "b"],
+])
+def test_json_output_parses(stocked, capsys, argv):
+    stocked(*argv, "--json")
+    out = capsys.readouterr().out
+    assert json.loads(out)          # one object, one line
+    assert out.count("\n") == 1
+
+
+def test_whereis_json_carries_the_placements(stocked, capsys):
+    stocked("whereis", "shared.txt", "--json")
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["hash"].startswith("sha256:")
+    assert doc["copies"] == 2 and doc["backup_copies"] == 2
+    assert {p["medium_id"] for p in doc["placements"]} == {"a", "b"}
+
+
+def test_only_on_json_matches_the_report(stocked, capsys):
+    stocked("only-on", "a", "--json")
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["files"] == 1
+    assert doc["items"][0]["path"] == "only-here.txt"
+
+
+def test_redundancy_exit_code_enforces_the_policy(stocked):
+    """The README has called this a checkable report since v0.1; until now
+    it exited 0 whatever it found, so nothing could check it."""
+    stocked("redundancy", "--min-copies", "2")          # no flag: still 0
+    with pytest.raises(SystemExit) as e:
+        stocked("redundancy", "--min-copies", "3", "--exit-code")
+    assert e.value.code == 1
+
+
+def test_redundancy_exit_code_is_quiet_when_the_policy_holds(stocked):
+    """Everything here has at least one backup copy, so --min-copies 1
+    passes. (At 2 it does not: only-here.txt sits on a single medium.)"""
+    stocked("redundancy", "--min-copies", "1", "--exit-code")   # no raise
+
+
+def test_only_on_exit_code_gates_wiping_a_drive(stocked):
+    """`holdings only-on old-drive --exit-code || wipe` — the workflow the
+    README describes, made actually gateable."""
+    with pytest.raises(SystemExit) as e:
+        stocked("only-on", "a", "--exit-code")
+    assert e.value.code == 1
+    stocked("only-on", "b", "--exit-code")              # nothing only on b
+
+
+def test_exit_code_and_json_compose(stocked, capsys):
+    with pytest.raises(SystemExit):
+        stocked("redundancy", "--min-copies", "3", "--exit-code", "--json")
+    assert json.loads(capsys.readouterr().out)["below"] > 0
+
+
+def test_check_json_reports_drift(stocked, db, capsys):
+    stocked("check", "--json")
+    assert json.loads(capsys.readouterr().out) == {"consistent": True,
+                                                   "problems": []}
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE content SET backup_copies=9")
+    with pytest.raises(SystemExit):
+        stocked("check", "--json")
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["consistent"] is False and doc["problems"]
