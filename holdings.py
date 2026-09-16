@@ -925,7 +925,9 @@ def build_parser():
                             "cloud", "other"])
     s.add_argument("--location", help="where it physically lives")
     s.add_argument("--backup", action="store_true",
-                   help="counts toward backup redundancy")
+                   help="counts toward backup redundancy -- only for media"
+                        " where the copy survives deletion of the original"
+                        " (a sync mirror does not; see the README)")
     s.add_argument("--notes")
     s.set_defaults(func=cmd_add_medium, writes=True)
 

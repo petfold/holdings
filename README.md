@@ -61,6 +61,41 @@ restic -r b2:bucket:repo ls --json latest | ./holdings.py import-restic restic-b
 back those files up via restic, rescan, watch the list empty, then wipe the
 drive with confidence.
 
+## What counts as a backup copy
+
+`--backup` is what `redundancy` and `only-on` count, and `only-on` is a list
+people wipe drives from — so it is worth being strict about. **holdings
+cannot verify the claim.** It takes `--backup` at face value when you
+register a medium, which makes it your assertion, not a measurement.
+
+The test is not "the file is in two places". It is: *if the original is
+deleted, does the copy survive?*
+
+| medium | survives | does not survive |
+|---|---|---|
+| second drive, offsite or offline | deletion, ransomware, device loss | its own failure |
+| restic repo, versioned object storage | deletion of the original | the repo being lost or pruned |
+| **Syncthing / Dropbox / Drive mirror** | losing a device | **deletion — it propagates** |
+| git remote (GitHub, Hugging Face, Radicle) | losing the working tree | anything uncommitted, unpushed or ignored |
+| Swarm pin | losing every device you own | **the postage batch lapsing** |
+
+The one that catches people is the sync mirror. A Syncthing or Dropbox
+folder is just a path, so `holdings scan cloud-dropbox ~/Dropbox` works
+today — but marking it `--backup` makes `redundancy` report two copies of a
+file that a single `rm` removes from both. It protects against device loss
+and nothing else.
+
+Hubs have a different catch: only content that is **committed *and* pushed**
+is really there, which is never the files you are actively editing. And each
+hub fails its own way — a single custodian who can close your account
+(GitHub, Hugging Face), or, for peer-to-peer hosting like Radicle,
+availability that is the sum of whoever volunteers to seed you. A Radicle
+repo seeded only by your own node is not a second copy; it is the same
+copy.
+
+None of this is modelled yet — `--backup` is one boolean standing in for all
+of it. See [ROADMAP.md](ROADMAP.md) for the shape of the fix.
+
 ## Reading a published catalog (optional)
 
 The catalog is a path, so distributing it is someone else's job — and the
