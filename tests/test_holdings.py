@@ -1421,3 +1421,108 @@ def test_a_genuinely_removed_file_is_still_pruned(run, db, capsys, tmp_path):
     with sqlite3.connect(db) as c:
         assert {p for p, in c.execute("SELECT path FROM instances")} \
             == {"keep.txt"}
+
+
+# --------------------------------------------------------- sites and 3-2-1
+
+@pytest.fixture
+def two_drives_one_room(run, tmp_path, capsys):
+    """The case that motivated sites: two backup drives, same room."""
+    src, d1, d2 = tmp_path / "src", tmp_path / "d1", tmp_path / "d2"
+    write(src / "photo.jpg", "photo")
+    write(d1 / "photo.jpg", "photo")
+    write(d2 / "photo.jpg", "photo")
+    run("add-medium", "laptop", "--kind", "laptop", "--site", "home")
+    run("add-medium", "drive-a", "--kind", "drive",
+        "--durability", "independent", "--site", "home")
+    run("add-medium", "drive-b", "--kind", "drive",
+        "--durability", "independent", "--site", "home")
+    run("scan", "laptop", str(src))
+    run("scan", "drive-a", str(d1))
+    run("scan", "drive-b", str(d2))
+    capsys.readouterr()
+    return run
+
+
+def test_two_copies_in_one_room_satisfy_copies_but_not_sites(
+        two_drives_one_room, db, capsys):
+    """Fire, flood, theft and a ransomware process walking mounted volumes
+    take both. The count says two; the separation says one."""
+    run = two_drives_one_room
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT backup_copies, backup_sites, backup_kinds"
+                         " FROM content").fetchone() == (2, 1, 1)
+    run("redundancy", "--min-copies", "2", "--exit-code")     # passes
+    with pytest.raises(SystemExit) as e:
+        run("redundancy", "--min-copies", "2", "--min-sites", "2",
+            "--exit-code")
+    assert e.value.code == 1
+
+
+def test_moving_one_drive_offsite_satisfies_the_policy(
+        two_drives_one_room, capsys):
+    run = two_drives_one_room
+    run("add-medium", "drive-b", "--kind", "drive",
+        "--durability", "independent", "--site", "budapest")
+    capsys.readouterr()
+    run("redundancy", "--min-copies", "2", "--min-sites", "2", "--exit-code")
+
+
+def test_media_without_a_site_are_not_assumed_separate(run, capsys, tmp_path):
+    """Conservative by design: unknown is not the same as known-different,
+    so unsited media collapse into one site rather than inflating the count."""
+    d1, d2 = tmp_path / "d1", tmp_path / "d2"
+    write(d1 / "a.txt", "a")
+    write(d2 / "a.txt", "a")
+    run("add-medium", "x", "--kind", "drive", "--durability", "independent")
+    run("add-medium", "y", "--kind", "drive", "--durability", "independent")
+    run("scan", "x", str(d1))
+    run("scan", "y", str(d2))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "2", "--min-sites", "2",
+            "--exit-code")
+
+
+def test_min_kinds_is_the_two_media_types_of_321(run, db, capsys, tmp_path):
+    d1, d2 = tmp_path / "d1", tmp_path / "d2"
+    write(d1 / "a.txt", "a")
+    write(d2 / "a.txt", "a")
+    run("add-medium", "drive", "--kind", "drive",
+        "--durability", "independent", "--site", "home")
+    run("add-medium", "restic", "--kind", "restic-repo",
+        "--durability", "independent", "--site", "cloud")
+    run("scan", "drive", str(d1))
+    run("scan", "restic", str(d2))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT backup_kinds FROM content").fetchone()[0] == 2
+    run("redundancy", "--min-copies", "2", "--min-sites", "2",
+        "--min-kinds", "2", "--exit-code")
+
+
+def test_a_site_survives_re_registering_the_medium(run, db, capsys):
+    run("add-medium", "d", "--kind", "drive", "--site", "budapest")
+    run("add-medium", "d", "--kind", "drive", "--location", "moved shelf")
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT site FROM media").fetchone()[0] == "budapest"
+
+
+def test_the_full_policy_report_names_what_failed(two_drives_one_room,
+                                                  capsys):
+    run = two_drives_one_room
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "2", "--min-sites", "2",
+            "--exit-code")
+    out = capsys.readouterr().out
+    assert "2 sites" in out and "SITE" in out
+
+
+def test_policy_json_carries_the_thresholds(two_drives_one_room, capsys):
+    run = two_drives_one_room
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-sites", "2", "--json", "--exit-code")
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["min_sites"] == 2
+    assert doc["items"][0]["backup_sites"] == 1

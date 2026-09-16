@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS media (
     -- refresh time. Kept as a column because every report joins on it.
     is_backup     INTEGER NOT NULL DEFAULT 0,
     durability    TEXT NOT NULL DEFAULT 'working',  -- see DURABILITY
+    -- Media at one site fail together: fire, flood, theft, and ransomware
+    -- walking every volume that happens to be mounted. Durability says what
+    -- kills a copy; site says what kills several at once.
+    site          TEXT,
     lease_expires REAL,                      -- when a leased copy lapses
     lease_checked REAL,                      -- when that estimate was taken
     notes         TEXT,
@@ -86,6 +90,8 @@ CREATE TABLE IF NOT EXISTS content (
     -- ALTER TABLE on older catalogs, so they stay last (see instances.name).
     copies        INTEGER NOT NULL DEFAULT 0,-- distinct media holding it
     backup_copies INTEGER NOT NULL DEFAULT 0,-- distinct *backup* media
+    backup_sites  INTEGER NOT NULL DEFAULT 0,-- distinct sites among those
+    backup_kinds  INTEGER NOT NULL DEFAULT 0,-- distinct kinds among those
     example_path  TEXT                       -- lowest path, for reports
 );
 
@@ -167,6 +173,9 @@ def migrate(conn: sqlite3.Connection) -> None:
         ("instances", "name", "TEXT"),
         ("instances", "only_here", "INTEGER NOT NULL DEFAULT 0"),
         ("media", "durability", "TEXT NOT NULL DEFAULT 'working'"),
+        ("media", "site", "TEXT"),
+        ("content", "backup_sites", "INTEGER NOT NULL DEFAULT 0"),
+        ("content", "backup_kinds", "INTEGER NOT NULL DEFAULT 0"),
         ("media", "lease_expires", "REAL"),
         ("media", "lease_checked", "REAL"),
         ("media", "only_here_count", "INTEGER NOT NULL DEFAULT 0"),
@@ -446,7 +455,7 @@ QUERIES = {
     "media":
         "SELECT medium_id, kind, is_backup, location_hint, last_scanned,"
         "       file_count, byte_count, only_here_count, only_here_bytes,"
-        "       durability, lease_expires"
+        "       durability, lease_expires, site"
         " FROM media ORDER BY medium_id",
     "summary":
         "SELECT content_count, content_bytes, instance_count"
@@ -471,6 +480,17 @@ QUERIES = {
     "redundancy_total":
         "SELECT COALESCE(SUM(content_count), 0) AS n FROM backup_histogram"
         " WHERE backup_copies < ?",
+    # The full 3-2-1 form. Not index-served -- the OR defeats
+    # idx_content_redundancy -- so it is opt-in, and the default path above
+    # keeps its index and its page economy.
+    "policy_rows":
+        "SELECT hash, size, backup_copies, copies, example_path,"
+        "       backup_sites, backup_kinds FROM content"
+        " WHERE backup_copies < ? OR backup_sites < ? OR backup_kinds < ?"
+        " ORDER BY backup_copies, size DESC LIMIT ?",
+    "policy_total":
+        "SELECT COUNT(*) AS n FROM content"
+        " WHERE backup_copies < ? OR backup_sites < ? OR backup_kinds < ?",
     "only_on_rows":
         "SELECT path, size FROM instances"
         " WHERE medium_id=? AND only_here=1"
@@ -504,6 +524,12 @@ SELECT i.hash AS hash,
        COUNT(DISTINCT i.medium_id) AS copies,
        COUNT(DISTINCT CASE WHEN m.is_backup THEN i.medium_id END)
            AS backup_copies,
+       -- A medium with no site recorded cannot be claimed to be separate
+       -- from another, so they all collapse into one unknown site. Being
+       -- conservative here means under-counting separation, never over.
+       COUNT(DISTINCT CASE WHEN m.is_backup
+                           THEN COALESCE(m.site, '?') END) AS backup_sites,
+       COUNT(DISTINCT CASE WHEN m.is_backup THEN m.kind END) AS backup_kinds,
        MIN(i.path) AS example_path
   FROM instances i JOIN media m ON m.medium_id = i.medium_id
  GROUP BY i.hash
@@ -511,6 +537,7 @@ SELECT i.hash AS hash,
 
 _RECOMPUTE = f"""
 SELECT c.hash, COALESCE(x.copies, 0), COALESCE(x.backup_copies, 0),
+       COALESCE(x.backup_sites, 0), COALESCE(x.backup_kinds, 0),
        x.example_path
   FROM content c LEFT JOIN ({_GROUPED}) x ON x.hash = c.hash
 """
@@ -576,6 +603,10 @@ def refresh_derived(conn) -> None:
         "    (SELECT copies FROM _counts WHERE hash = content.hash), 0),"
         "  backup_copies = COALESCE("
         "    (SELECT backup_copies FROM _counts WHERE hash = content.hash), 0),"
+        "  backup_sites = COALESCE("
+        "    (SELECT backup_sites FROM _counts WHERE hash = content.hash), 0),"
+        "  backup_kinds = COALESCE("
+        "    (SELECT backup_kinds FROM _counts WHERE hash = content.hash), 0),"
         "  example_path ="
         "    (SELECT example_path FROM _counts WHERE hash = content.hash)")
     conn.execute("DROP TABLE temp._counts")
@@ -662,7 +693,8 @@ def derived_drift(conn) -> list[str]:
 
     expected = {h: row for h, *row in conn.execute(_RECOMPUTE)}
     stored = {h: row for h, *row in conn.execute(
-        "SELECT hash, copies, backup_copies, example_path FROM content")}
+        "SELECT hash, copies, backup_copies, backup_sites, backup_kinds,"
+        "       example_path FROM content")}
     off = [h for h in stored if stored[h] != expected.get(h)]
     if off:
         problems.append(
@@ -777,13 +809,15 @@ def cmd_add_medium(conn, args):
     # earlier call that this one is not changing.
     conn.execute(
         "INSERT OR REPLACE INTO media"
-        " (medium_id, kind, location_hint, durability, notes, last_scanned,"
-        "  lease_expires, lease_checked)"
-        " VALUES (?,?,?,?,?,"
+        " (medium_id, kind, location_hint, durability, site, notes,"
+        "  last_scanned, lease_expires, lease_checked)"
+        " VALUES (?,?,?,?,"
+        "   COALESCE(?, (SELECT site FROM media WHERE medium_id=?)),?,"
         "   (SELECT last_scanned FROM media WHERE medium_id=?),"
         "   COALESCE(?, (SELECT lease_expires FROM media WHERE medium_id=?)),"
         "   COALESCE(?, (SELECT lease_checked FROM media WHERE medium_id=?)))",
-        (args.medium_id, args.kind, args.location, durability, args.notes,
+        (args.medium_id, args.kind, args.location, durability,
+         args.site, args.medium_id, args.notes,
          args.medium_id,
          expires, args.medium_id,
          time.time() if expires else None, args.medium_id),
@@ -801,22 +835,23 @@ def cmd_media(conn, args):
     fields = ("medium_id", "kind", "is_backup", "location_hint",
               "last_scanned", "file_count", "byte_count",
               "only_here_count", "only_here_bytes",
-              "durability", "lease_expires")
+              "durability", "lease_expires", "site")
     if emit_json(args, {"media": [dict(zip(fields, r)) for r in rows]}):
         return
     if not rows:
         print("no media registered yet — use: holdings add-medium <id> --kind drive")
         return
-    print(f"{'MEDIUM':22} {'KIND':12} {'SURVIVES':12} {'FILES':>8}"
-          f" {'SIZE':>10} {'LAST SCAN':19}  LOCATION")
+    print(f"{'MEDIUM':22} {'KIND':12} {'SURVIVES':12} {'SITE':10}"
+          f" {'FILES':>8} {'SIZE':>10} {'LAST SCAN':19}  LOCATION")
     for (mid, kind, _bk, loc, ts, nfiles, nbytes, _only_n, _only_b,
-         durability, expires) in rows:
+         durability, expires, site) in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "never"
         shown = durability
         if durability == "leased" and expires:
             shown = f"{durability}*" if expires <= time.time() else durability
-        print(f"{mid:22} {kind:12} {shown:12} {nfiles:>8}"
-              f" {human_size(nbytes):>10} {when:19}  {loc or ''}")
+        print(f"{mid:22} {kind:12} {shown:12} {(site or '-'):10}"
+              f" {nfiles:>8} {human_size(nbytes):>10} {when:19}"
+              f"  {loc or ''}")
 
 
 def cmd_scan(conn, args):
@@ -1061,37 +1096,63 @@ def resolve_hash(conn, target: str):
 
 def cmd_redundancy(conn, args):
     """Content with fewer than --min-copies copies on *backup* media."""
-    rows = conn.execute(QUERIES["redundancy_rows"],
-                        (args.min_copies, args.limit)).fetchall()
-    total = conn.execute(QUERIES["redundancy_total"],
-                         (args.min_copies,)).fetchone()[0]
+    # The default question -- "fewer than N backup copies" -- stays on the
+    # index. Asking the full 3-2-1 question costs a scan, so it happens only
+    # when the extra thresholds are actually set.
+    full = args.min_sites > 1 or args.min_kinds > 1
+    if full:
+        rows = conn.execute(
+            QUERIES["policy_rows"],
+            (args.min_copies, args.min_sites, args.min_kinds,
+             args.limit)).fetchall()
+        total = conn.execute(
+            QUERIES["policy_total"],
+            (args.min_copies, args.min_sites, args.min_kinds)).fetchone()[0]
+    else:
+        rows = conn.execute(QUERIES["redundancy_rows"],
+                            (args.min_copies, args.limit)).fetchall()
+        total = conn.execute(QUERIES["redundancy_total"],
+                             (args.min_copies,)).fetchone()[0]
     # A lease can lapse with no write happening, so the materialised counts
     # above can be right as of the last scan and wrong now. Checked here,
     # and counted as a violation: a backup you have stopped paying for is
     # not a backup, and this is the report that gates other people's cron.
     risks = lease_risks(conn, args.lease_margin)
 
+    cols = ("hash", "size", "backup_copies", "copies", "example_path",
+            "backup_sites", "backup_kinds")
     if emit_json(args, {
             "min_copies": args.min_copies,
+            "min_sites": args.min_sites,
+            "min_kinds": args.min_kinds,
             "below": total,
             "leases_at_risk": [{"medium_id": m, "status": w}
                                for m, w in risks],
-            "items": [dict(zip(("hash", "size", "backup_copies", "copies",
-                                "example_path"), r)) for r in rows]}):
+            "items": [dict(zip(cols, r)) for r in rows]}):
         policy_exit(args, total + len(risks))
         return
     for mid, why in risks:
         print(f"AT RISK: leased medium '{mid}' -- {why}", file=sys.stderr)
+    def plural(n, word):
+        return f"{n} {word}{'' if n == 1 else 's'}"
+
+    policy = plural(args.min_copies, "backup copy").replace("copys", "copies")
+    if full:
+        policy += (f", {plural(args.min_sites, 'site')}"
+                   f", {plural(args.min_kinds, 'kind')}")
     if not rows:
-        print(f"OK: everything has at least {args.min_copies}"
-              f" backup cop{'y' if args.min_copies==1 else 'ies'}.")
+        print(f"OK: everything meets {policy}.")
         policy_exit(args, total + len(risks))
         return
-    print(f"{total} content objects below {args.min_copies} backup copies"
+    print(f"{total} content objects below {policy}"
           f" (showing up to {args.limit}, largest first):")
-    print(f"{'BK':>2} {'ALL':>3} {'SIZE':>10}  EXAMPLE PATH")
-    for h, size, bcopies, copies, path in rows:
-        print(f"{bcopies:>2} {copies:>3} {human_size(size):>10}  {path}")
+    head = f"{'BK':>2} {'ALL':>3}" + (f" {'SITE':>4} {'KIND':>4}" if full else "")
+    print(f"{head} {'SIZE':>10}  EXAMPLE PATH")
+    for row in rows:
+        h, size, bcopies, copies, path = row[:5]
+        extra = f" {row[5]:>4} {row[6]:>4}" if full else ""
+        print(f"{bcopies:>2} {copies:>3}{extra}"
+              f" {human_size(size):>10}  {path}")
     policy_exit(args, total + len(risks))
 
 
@@ -1236,6 +1297,10 @@ def build_parser():
                    help="what this copy survives; "
                         + "; ".join(f"{k}: {v.split(' (')[0]}"
                                     for k, v in DURABILITY.items()))
+    s.add_argument("--site", metavar="NAME",
+                   help="where this medium physically is, as a name you reuse"
+                        " ('home', 'budapest'). Media sharing a site are"
+                        " assumed to fail together")
     s.add_argument("--lease-expires", metavar="WHEN",
                    help="for --durability leased: YYYY-MM-DD, or a duration"
                         " from now such as 30d or 4w")
@@ -1268,6 +1333,12 @@ def build_parser():
 
     s = reads("redundancy", help="content below N backup copies")
     s.add_argument("--min-copies", type=int, default=2)
+    s.add_argument("--min-sites", type=int, default=1, metavar="N",
+                   help="the '1 offsite' of 3-2-1: require backup copies at"
+                        " N distinct sites (default 1, i.e. unchecked)")
+    s.add_argument("--min-kinds", type=int, default=1, metavar="N",
+                   help="the '2 media' of 3-2-1: require backup copies on N"
+                        " distinct kinds of medium (default 1, unchecked)")
     s.add_argument("--limit", type=int, default=40)
     s.add_argument("--lease-margin", type=float, metavar="DAYS",
                    default=DEFAULT_LEASE_MARGIN_DAYS,
