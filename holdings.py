@@ -63,13 +63,12 @@ CREATE TABLE IF NOT EXISTS instances (
     size      INTEGER NOT NULL,
     mtime     REAL,                          -- NULL for imported (e.g. restic) listings
     seen_at   REAL NOT NULL,
+    -- Derived from path, stored because it is what gets searched for.
+    -- Added by ALTER TABLE on older catalogs, so it must stay last here:
+    -- fresh and migrated databases then agree on column order.
+    name      TEXT,                          -- basename of path
     PRIMARY KEY (medium_id, path)
 );
-CREATE INDEX IF NOT EXISTS idx_instances_hash ON instances(hash);
--- The primary key is (medium_id, path), so a lookup by path alone --
--- `whereis <path>`, the commonest query there is -- would otherwise
--- scan every instance. Cheap locally, ruinous over a network.
-CREATE INDEX IF NOT EXISTS idx_instances_path ON instances(path);
 
 CREATE TABLE IF NOT EXISTS scans (
     scan_id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +82,47 @@ CREATE TABLE IF NOT EXISTS scans (
 );
 """
 
+# Created after any migration, since an index can name a column that a
+# migration has only just added.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_instances_hash ON instances(hash);
+-- The primary key is (medium_id, path), so a lookup by path alone --
+-- `whereis <path>`, the commonest query there is -- would otherwise scan
+-- every instance. Cheap locally, ruinous over a network: measured at 9+
+-- minutes unfinished against a 125 MB catalog published to Swarm, versus
+-- 8 pages (0.03% of the file) with the index.
+CREATE INDEX IF NOT EXISTS idx_instances_path ON instances(path);
+-- And `whereis <bare filename>` searches the basename, which no index can
+-- serve from `path` (the pattern starts with a wildcard), hence `name`.
+CREATE INDEX IF NOT EXISTS idx_instances_name ON instances(name);
+"""
+
+
+def basename(path: str) -> str:
+    """The name part of a stored (always '/'-separated) relative path."""
+    return path.rpartition("/")[2]
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Bring an older catalog up to the current schema, in place.
+
+    Deliberately not "drop it and rescan". The contract says everything is
+    regenerable by re-scanning, but that is not a licence to discard the
+    catalog: its whole value is facts about media that are *not* reachable
+    right now — a drive in a safe in another country cannot be rescanned on
+    demand, and dropping the file would lose exactly the part that cannot be
+    rebuilt. Migrations here are additive and idempotent.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(instances)")}
+    if "name" not in cols:
+        conn.execute("ALTER TABLE instances ADD COLUMN name TEXT")
+    stale = conn.execute(
+        "SELECT medium_id, path FROM instances WHERE name IS NULL").fetchall()
+    if stale:
+        conn.executemany(
+            "UPDATE instances SET name=? WHERE medium_id=? AND path=?",
+            [(basename(path), mid, path) for mid, path in stale])
+        conn.commit()
 
 
 def db_connect(db_path: str) -> sqlite3.Connection:
@@ -91,6 +131,8 @@ def db_connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    migrate(conn)
+    conn.executescript(INDEXES)
     return conn
 
 
@@ -317,13 +359,15 @@ def cmd_scan(conn, args):
                 " ON CONFLICT(hash) DO NOTHING",
                 (file_hash, st.st_size, time.time()))
             conn.execute(
-                "INSERT INTO instances (medium_id, path, hash, size, mtime, seen_at)"
-                " VALUES (?,?,?,?,?,?)"
+                "INSERT INTO instances"
+                " (medium_id, path, name, hash, size, mtime, seen_at)"
+                " VALUES (?,?,?,?,?,?,?)"
                 " ON CONFLICT(medium_id, path) DO UPDATE SET"
-                "   hash=excluded.hash, size=excluded.size,"
+                "   name=excluded.name, hash=excluded.hash,"
+                "   size=excluded.size,"
                 "   mtime=excluded.mtime, seen_at=excluded.seen_at",
-                (args.medium_id, rel_path, file_hash, st.st_size,
-                 st.st_mtime, time.time()))
+                (args.medium_id, rel_path, basename(rel_path), file_hash,
+                 st.st_size, st.st_mtime, time.time()))
             if files_seen % 500 == 0:
                 conn.commit()
                 print(f"  … {files_seen} files ({human_size(bytes_seen)})",
@@ -390,11 +434,13 @@ def cmd_import_restic(conn, args):
                     "INSERT INTO content (hash, size, first_seen) VALUES (?,?,?)"
                     " ON CONFLICT(hash) DO NOTHING", (h, size, time.time()))
             conn.execute(
-                "INSERT INTO instances (medium_id, path, hash, size, mtime, seen_at)"
-                " VALUES (?,?,?,?,NULL,?)"
+                "INSERT INTO instances"
+                " (medium_id, path, name, hash, size, mtime, seen_at)"
+                " VALUES (?,?,?,?,?,NULL,?)"
                 " ON CONFLICT(medium_id, path) DO UPDATE SET"
-                "   hash=excluded.hash, size=excluded.size, seen_at=excluded.seen_at",
-                (args.medium_id, path, h, size, time.time()))
+                "   name=excluded.name, hash=excluded.hash,"
+                "   size=excluded.size, seen_at=excluded.seen_at",
+                (args.medium_id, path, basename(path), h, size, time.time()))
             count += 1
     conn.execute(
         "DELETE FROM instances WHERE medium_id=? AND seen_at<?",
@@ -455,8 +501,8 @@ def resolve_hash(conn, target: str):
     if row:
         return row[0]
     rows = conn.execute(
-        "SELECT DISTINCT hash FROM instances WHERE path LIKE ? LIMIT 2",
-        ("%/" + target,)).fetchall()
+        "SELECT DISTINCT hash FROM instances WHERE name=? LIMIT 2",
+        (target,)).fetchall()
     if len(rows) == 1:
         return rows[0][0]
     if len(rows) > 1:

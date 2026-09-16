@@ -94,19 +94,20 @@ Two things this deliberately is not:
   Single-writer is the design contract, not a limitation of the transport.
 
 Worth knowing before leaning on it. Measured against a live Bee node on a
-125 MB catalog (120k files, 300k placements), cold cache each time:
+130 MB published catalog (120k files, 300k placements) — whole command,
+cold cache each time:
 
-| query | pages | fetched |
-|---|---|---|
-| `whereis sha256:…` | 17 | 0.06% |
-| `whereis <full path>` | 8 | 0.03% |
-| `whereis <bare filename>` | — | did not finish in 8 min |
-| `redundancy`, `only-on`, `stats`, `media` | — | did not finish in 8 min |
+| query | pages fetched | of the file | time |
+|---|---|---|---|
+| `whereis sha256:…` | 17 | 0.05% | 14.6s |
+| `whereis <full path>` | 20 | 0.06% | 11.0s |
+| `whereis <bare filename>` | 23 | 0.07% | 1.8s |
+| `redundancy`, `only-on`, `stats`, `media` | — | did not finish in 8 min | |
 
-So the hash- and path-keyed lookups are what this is good for today. A bare
-filename falls back to `path LIKE '%/name'`, which no index can serve, and
-the reports are full scans — both are roadmap items ([ROADMAP.md](ROADMAP.md))
-and both are worth fixing locally regardless of Swarm.
+So lookups are what a published catalog is good for today — three orders of
+magnitude less than the file, on any of the three ways of naming a file. The
+reports are still full scans and remain a roadmap item
+([ROADMAP.md](ROADMAP.md)), worth fixing locally regardless of Swarm.
 
 ## Projection contract (OntoDAG integration)
 
@@ -149,7 +150,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **64 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **69 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

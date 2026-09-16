@@ -70,18 +70,19 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
       touches it. Write commands (`add-medium`, `scan`, `import-restic`)
       refuse a published catalog and point back at the local file —
       single-writer is the contract, not a transport limitation.
-- [x] **Index `instances(path)`** (DONE 2026-09-16): the primary key is
-      `(medium_id, path)`, so a lookup by path alone scanned every row —
-      invisible locally, fatal over a network. Measured on a live node
-      against a 125 MB catalog (120k files, 300k placements), cold:
-      `whereis sha256:…` 17 pages (0.06%), `whereis <full path>` 8 pages
-      (0.03%). Before the index, the path lookup did not finish in 9 minutes.
-- [ ] **A bare filename has no index to use.** `resolve_hash` falls back to
-      `path LIKE '%/name'`, which a leading wildcard makes unservable — and
-      `whereis holiday.jpg` is the README's own headline example. Measured:
-      did not finish in 8 minutes over the network. Wants a stored basename
-      column with its own index, which is a schema change and a migration,
-      hence its own item.
+- [x] **Every way of naming a file is now an indexed lookup**
+      (DONE 2026-09-16). The primary key is `(medium_id, path)`, so a lookup
+      by path alone scanned every row; a bare filename fell back to
+      `path LIKE '%/name'`, which a leading wildcard makes unservable by any
+      index — and `whereis holiday.jpg` is the README's own headline
+      example. Both were invisible locally and fatal over a network (each
+      failed to finish in 8–9 minutes). Fixed by `idx_instances_path` and by
+      storing the basename in `instances.name` with its own index, migrated
+      in place. Measured on a live node, 130 MB published catalog, whole
+      command, cold: by hash 17 pages (0.05%), by full path 20 pages
+      (0.06%), by bare filename 23 pages (0.07%).
+      Cost: the column and its index add ~12% to the catalog on disk, and
+      backfilling 300k rows took 16s once.
 - [ ] **Materialise the backup-copy count on `content`**, refreshed at scan
       time, so `redundancy` and `only-on` become index range scans rather
       than full scans with correlated subqueries. Measured: `redundancy`,

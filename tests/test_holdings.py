@@ -290,7 +290,11 @@ def test_resolve_by_exact_path_and_by_basename(run, db, tmp_path):
 
 
 def test_ambiguous_basename_refuses_to_guess(run, db, tmp_path):
-    """Two different files, same name: the tool must not pick one."""
+    """Two different files, same name: the tool must not pick one.
+
+    Since the basename lookup moved onto `instances.name`, this also pins
+    that the index did not cost the ambiguity check.
+    """
     root = tmp_path / "disk"
     write(root / "one" / "notes.txt", "first")
     write(root / "two" / "notes.txt", "second")
@@ -693,3 +697,87 @@ def test_no_wal_warning_when_there_is_nothing_uncheckpointed(
     holdings.main(["--db", f"file://{db}", "stats"])
     assert capsys.readouterr().err == ""
 
+
+# ------------------------------------------------------- basename lookups
+
+OLD_INSTANCES = """
+CREATE TABLE media (medium_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+    location_hint TEXT, is_backup INTEGER NOT NULL DEFAULT 0, notes TEXT,
+    last_scanned REAL);
+CREATE TABLE content (hash TEXT PRIMARY KEY, size INTEGER NOT NULL,
+    first_seen REAL NOT NULL);
+CREATE TABLE instances (medium_id TEXT NOT NULL, path TEXT NOT NULL,
+    hash TEXT NOT NULL, size INTEGER NOT NULL, mtime REAL,
+    seen_at REAL NOT NULL, PRIMARY KEY (medium_id, path));
+"""
+
+
+def test_basename_of_a_stored_path():
+    assert holdings.basename("archive/2019/holiday.jpg") == "holiday.jpg"
+    assert holdings.basename("holiday.jpg") == "holiday.jpg"
+    assert holdings.basename("a/b/") == ""
+
+
+def test_whereis_by_bare_filename_uses_the_name_index(db, run, tmp_path):
+    """The lookup `whereis holiday.jpg` performs — the README's own example.
+
+    It used to be `path LIKE '%/name'`, which a leading wildcard makes
+    unservable by any index: measured at 8 minutes unfinished over the
+    network on a 125 MB catalog.
+    """
+    write(tmp_path / "disk" / "deep" / "holiday.jpg", "photo")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    with sqlite3.connect(db) as c:
+        plan = c.execute("EXPLAIN QUERY PLAN SELECT DISTINCT hash FROM"
+                         " instances WHERE name=? LIMIT 2", ("x",)).fetchall()
+    assert "idx_instances_name" in plan[0][-1]
+
+
+def test_same_name_same_content_is_not_ambiguous(run, capsys, tmp_path):
+    write(tmp_path / "disk" / "a" / "notes.txt", "same")
+    write(tmp_path / "disk" / "b" / "notes.txt", "same")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    capsys.readouterr()
+    run("whereis", "notes.txt")                 # one hash, two placements
+    assert "present on 1 media" in capsys.readouterr().out
+
+
+def test_an_older_catalog_is_migrated_in_place_not_discarded(tmp_path, capsys):
+    """A catalog holds facts about media that cannot be rescanned on demand —
+    a drive in a safe in another country — so migration is additive."""
+    db = str(tmp_path / "old.sqlite")
+    old = sqlite3.connect(db)
+    old.executescript(OLD_INSTANCES)
+    old.execute("INSERT INTO media (medium_id, kind, is_backup)"
+                " VALUES ('drive-budapest','drive',1)")
+    old.execute("INSERT INTO content VALUES ('sha256:aa', 10, 0)")
+    old.execute("INSERT INTO instances (medium_id, path, hash, size, seen_at)"
+                " VALUES ('drive-budapest','archive/2019/holiday.jpg',"
+                "'sha256:aa',10,0)")
+    old.commit()
+    old.close()
+
+    conn = holdings.db_connect(db)              # migrates on open
+    assert conn.execute("SELECT name FROM instances").fetchone()[0] \
+        == "holiday.jpg"
+    # and the irreplaceable part is still there
+    assert conn.execute("SELECT COUNT(*) FROM instances").fetchone()[0] == 1
+    conn.close()
+
+    holdings.main(["--db", db, "whereis", "holiday.jpg"])
+    assert "drive-budapest" in capsys.readouterr().out
+
+
+def test_migration_is_idempotent(tmp_path):
+    db = str(tmp_path / "old.sqlite")
+    c = sqlite3.connect(db)
+    c.executescript(OLD_INSTANCES)
+    c.commit()
+    c.close()
+    for _ in range(3):                          # opening repeatedly is safe
+        holdings.db_connect(db).close()
+    conn = sqlite3.connect(db)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(instances)")]
+    assert cols.count("name") == 1
