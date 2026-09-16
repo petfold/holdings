@@ -117,6 +117,11 @@ CREATE TABLE IF NOT EXISTS instances (
     -- backup exists and knowing it does.
     verified_at REAL,
     evidence    TEXT,                    -- hashed | metadata | imported
+    -- How the medium itself names this copy, when it names copies at all:
+    -- a Swarm reference today, an object version id later. Content hash
+    -- stays the identity; this is an address on one medium, and it is what
+    -- makes a remote copy checkable without downloading it.
+    external_ref TEXT,
     -- Derived from path, stored because it is what gets searched for.
     -- Added by ALTER TABLE on older catalogs, so it must stay last here:
     -- fresh and migrated databases then agree on column order.
@@ -188,6 +193,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         ("instances", "name", "TEXT"),
         ("instances", "only_here", "INTEGER NOT NULL DEFAULT 0"),
         ("instances", "verified_at", "REAL"),
+        ("instances", "external_ref", "TEXT"),
         ("instances", "evidence", "TEXT"),
         ("media", "durability", "TEXT NOT NULL DEFAULT 'working'"),
         ("media", "site", "TEXT"),
@@ -420,6 +426,27 @@ COUNTS_AS_BACKUP = ("independent", "leased", "hosted")
 # optimistic bound and wants headroom. Matches the runbook's
 # `swarmlite stamps --check --min-ttl`.
 DEFAULT_LEASE_MARGIN_DAYS = 14.0
+
+
+def batch_expiry(batch_id: str, api_url: str | None) -> float:
+    """When a postage batch runs out, as the node currently reckons it.
+
+    Worth asking the node rather than having someone type a date: the
+    number moves. It is an estimate at today's storage price, so it is
+    recorded together with the time it was taken and read back with a
+    margin -- see lease_risks.
+    """
+    try:
+        from swarmlite import stamps
+    except ModuleNotFoundError:
+        sys.exit("--lease-from-batch needs the optional extra:\n"
+                 "    pip install 'holdings[swarm]'")
+    for info in stamps.list_batches(api_url):
+        if info.batch_id.startswith(batch_id):
+            if not info.ttl:
+                sys.exit(f"batch {batch_id} reports no remaining time")
+            return time.time() + float(info.ttl)
+    sys.exit(f"no postage batch starting {batch_id} on the node")
 
 
 def parse_when(text: str) -> float:
@@ -908,7 +935,7 @@ def cmd_add_medium(conn, args):
     known = conn.execute("SELECT lease_expires FROM media WHERE medium_id=?",
                          (args.medium_id,)).fetchone()
     if (durability == "leased" and not args.lease_expires
-            and not (known and known[0])):
+            and not args.lease_from_batch and not (known and known[0])):
         sys.exit("--durability leased needs --lease-expires: a lease with no"
                  " end date would count as a backup copy forever, which is"
                  " the one thing a lease is not")
@@ -916,7 +943,16 @@ def cmd_add_medium(conn, args):
         sys.exit(f"--lease-expires applies to --durability leased,"
                  f" not '{durability}'")
 
-    expires = parse_when(args.lease_expires) if args.lease_expires else None
+    if args.lease_from_batch and args.lease_expires:
+        sys.exit("--lease-from-batch and --lease-expires both set the same"
+                 " thing; use one")
+    if args.lease_from_batch:
+        expires = batch_expiry(args.lease_from_batch, args.api_url)
+        print(f"postage batch {args.lease_from_batch[:8]}… expires"
+              f" {time.strftime('%Y-%m-%d', time.localtime(expires))}"
+              f" at today's price")
+    else:
+        expires = parse_when(args.lease_expires) if args.lease_expires else None
     # INSERT OR REPLACE rewrites the whole row, so anything not restated
     # here has to be carried over: the scan time, and a lease recorded by an
     # earlier call that this one is not changing.
@@ -1107,6 +1143,98 @@ def cmd_scan(conn, args):
               f" but this medium could not confirm them, and unreadable files"
               f" on a backup medium are how a drive announces it is failing.",
               file=sys.stderr)
+
+
+def swarm_listing(root: str, api_url: str | None):
+    """Every file under a published Swarm root, as (path, size, reference).
+
+    Needs the optional extra. Read-only: listing a manifest asks the node
+    what is there, it does not upload, and holdings stays out of the path
+    your data takes to get to Swarm.
+    """
+    try:
+        import fsspec
+    except ModuleNotFoundError:
+        sys.exit("--root needs the optional Swarm reader:\n"
+                 "    pip install 'holdings[swarm]'\n"
+                 "or pass a listing file instead (one JSON object per line"
+                 " with path, size and reference).")
+    opts = {"api_url": api_url} if api_url else {}
+    fs = fsspec.filesystem("bzz", **opts)
+    root = root.removeprefix("bzz://").strip("/")
+    for name, info in sorted(fs.find(root, detail=True).items()):
+        if info.get("type") != "file":
+            continue
+        yield {"path": name.removeprefix(root).lstrip("/"),
+               "size": info.get("size"),
+               "reference": info.get("reference")}
+
+
+def cmd_import_swarm(conn, args):
+    """Record what a published Swarm root holds, as a medium.
+
+    The same shape as import-restic, and the same honesty about it: a
+    listing gives paths and sizes, not content hashes, so entries are
+    matched to known content where that is unambiguous and recorded as
+    `unverified:` where it is not. For exact hashes, mount the root and
+    `scan` it -- reading the bytes is the only thing that proves them.
+
+    What Swarm adds over a restic listing is a per-file reference. Content
+    hash stays the identity; the reference is an address, and storing it is
+    what lets a copy be checked later without downloading it again.
+    """
+    medium = conn.execute("SELECT medium_id FROM media WHERE medium_id=?",
+                          (args.medium_id,)).fetchone()
+    if not medium:
+        sys.exit(f"unknown medium '{args.medium_id}' -- register it first"
+                 f" with add-medium (--durability leased, if it is stamped)")
+
+    started = time.time()
+    if args.root:
+        entries = swarm_listing(args.root, args.api_url)
+    else:
+        stream = sys.stdin if args.listing == "-" else open(args.listing)
+        entries = (json.loads(line) for line in stream if line.strip())
+
+    count = exact = 0
+    for e in entries:
+        path = str(e.get("path", "")).lstrip("/")
+        size = e.get("size")
+        if not path or size is None:
+            continue
+        h = match_known_content(conn, path, size)
+        if h is None:
+            h = f"unverified:swarm:{args.medium_id}:{path}:{size}"
+            conn.execute(
+                "INSERT INTO content (hash, size, first_seen) VALUES (?,?,?)"
+                " ON CONFLICT(hash) DO NOTHING", (h, size, time.time()))
+        else:
+            exact += 1
+        conn.execute(
+            "INSERT INTO instances"
+            " (medium_id, path, name, hash, size, mtime, seen_at, evidence,"
+            "  external_ref)"
+            " VALUES (?,?,?,?,?,NULL,?,'imported',?)"
+            " ON CONFLICT(medium_id, path) DO UPDATE SET"
+            "   name=excluded.name, hash=excluded.hash, size=excluded.size,"
+            "   seen_at=excluded.seen_at, evidence=excluded.evidence,"
+            "   external_ref=excluded.external_ref",
+            (args.medium_id, path, basename(path), h, size, time.time(),
+             e.get("reference")))
+        count += 1
+
+    conn.execute("DELETE FROM instances WHERE medium_id=? AND seen_at<?",
+                 (args.medium_id, started))
+    conn.execute("UPDATE media SET last_scanned=? WHERE medium_id=?",
+                 (time.time(), args.medium_id))
+    refresh_derived(conn)
+    conn.commit()
+    print(f"imported {count} entries into '{args.medium_id}'"
+          f" ({exact} matched to content already known by hash,"
+          f" {count - exact} recorded as unverified)")
+    if count:
+        print("note: a listing proves paths and sizes, not bytes. For exact"
+              " hashes, mount the root and `scan` it.", file=sys.stderr)
 
 
 def cmd_import_restic(conn, args):
@@ -1454,9 +1582,13 @@ def build_parser():
     s.add_argument("--lease-expires", metavar="WHEN",
                    help="for --durability leased: YYYY-MM-DD, or a duration"
                         " from now such as 30d or 4w")
+    s.add_argument("--lease-from-batch", metavar="BATCH_ID",
+                   help="read the expiry from a postage batch on the node"
+                        " rather than typing it (needs holdings[swarm])")
     s.add_argument("--backup", action="store_true",
                    help="shorthand for --durability independent")
     s.add_argument("--notes")
+    s.add_argument("--api-url")
     s.set_defaults(func=cmd_add_medium, writes=True)
 
     s = reads("media", help="list media")
@@ -1470,6 +1602,18 @@ def build_parser():
     s.add_argument("--full", action="store_true",
                    help="rehash everything (ignore mtime+size shortcut)")
     s.set_defaults(func=cmd_scan, writes=True)
+
+    s = sub.add_parser("import-swarm",
+                       help="record what a published Swarm root holds")
+    s.add_argument("medium_id")
+    s.add_argument("listing", nargs="?", default="-",
+                   help="JSON lines with path, size and reference"
+                        " ('-' = stdin); omit when using --root")
+    s.add_argument("--root", metavar="REF",
+                   help="list this published root from a node instead"
+                        " (needs holdings[swarm])")
+    s.add_argument("--api-url")
+    s.set_defaults(func=cmd_import_swarm, writes=True)
 
     s = sub.add_parser("import-restic",
                        help="ingest `restic ls --json` output ('-' = stdin)")

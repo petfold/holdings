@@ -195,6 +195,31 @@ what rot looks like. And a file that cannot be read is kept and reported
 rather than pruned as deleted, because a failing drive and a tidied-up one
 must not produce the same catalog change.
 
+### Swarm as a medium
+
+Content you have published to Swarm can count as a backup copy. It is a
+`leased` medium — it survives deleting the original, and lapses when the
+postage batch does — so the expiry can be read from the batch rather than
+typed:
+
+```bash
+./holdings.py add-medium swarm --kind cloud --durability leased \
+                               --lease-from-batch <batchID>
+./holdings.py import-swarm swarm --root <bzz-root>
+```
+
+`import-swarm` records each file's **Swarm reference** next to the content
+hash. The hash stays the identity; the reference is an address on one
+medium, and storing it is what makes a remote copy checkable later without
+downloading it again.
+
+The honesty is the same as `import-restic`: a listing proves paths and
+sizes, not bytes. Entries are matched to content already known by hash where
+that is unambiguous, and recorded as `unverified:` where it is not. For
+exact hashes, mount the root and `scan` it — reading the bytes is the only
+thing that proves them. Either way, holdings only ever *reads* the manifest:
+it does not upload, and stays out of the path your data takes to Swarm.
+
 ## Reading a published catalog (optional)
 
 The catalog is a path, so distributing it is someone else's job — and the
@@ -345,7 +370,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **151 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **160 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

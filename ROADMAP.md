@@ -199,9 +199,27 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
 
       Still open, and each now has somewhere to live:
 
-      * **Swarm as a medium** — `sha256 → swarm reference` mapping as a
-        by-product of publishing, so placement is exact. The lease
-        machinery it needed now exists.
+      * [x] **Swarm as a medium** (DONE 2026-09-16): `import-swarm`, and
+        `add-medium --lease-from-batch` so the expiry is read from the
+        postage batch rather than typed — the figure moves, and a typed one
+        goes stale silently. `instances.external_ref` holds the Swarm
+        reference beside the content hash: identity stays the hash, the
+        reference is an address, and it is what will make a remote copy
+        checkable without downloading it.
+
+        Placement is as exact as the evidence allows, not more: a manifest
+        listing gives paths and sizes, so entries match known content where
+        unambiguous and are `unverified:` otherwise, exactly as with restic.
+        Mounting the root and scanning it remains the way to get bytes.
+        Verified live against a node: a 138.8 MB published root imported,
+        reference recorded, and `due` then ranked it first because nothing
+        had ever read it.
+
+      * [ ] **Check a Swarm copy without downloading it** — the reference is
+        stored now, and Bee can be asked whether content is still
+        retrievable. That would make a leased copy the first remote medium
+        that can actually be verified rather than merely trusted.
+
       * **A generic listing importer** — restic, S3/B2, rclone and Swarm
         are one shape (a listing of paths and sizes), not four readers.
       * **Hubs** — needs git-awareness, not a directory scan: only content

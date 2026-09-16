@@ -618,7 +618,7 @@ def test_the_commands_that_write_are_the_ones_that_change_placement():
     [subs] = [a for a in holdings.build_parser()._actions
               if isinstance(a, argparse._SubParsersAction)]
     writers = {n for n, sp in subs.choices.items() if sp.get_default("writes")}
-    assert writers == {"add-medium", "scan", "import-restic"}
+    assert writers == {"add-medium", "scan", "import-restic", "import-swarm"}
 
 
 @pytest.mark.parametrize("argv", [
@@ -1784,3 +1784,151 @@ def test_due_is_read_only_so_it_works_on_a_published_catalog():
     [subs] = [a for a in holdings.build_parser()._actions
               if isinstance(a, argparse._SubParsersAction)]
     assert subs.choices["due"].get_default("writes") is False
+
+
+# ------------------------------------------------------- Swarm as a medium
+
+def swarm_listing_file(tmp_path, entries):
+    f = tmp_path / "swarm.jsonl"
+    f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    return str(f)
+
+
+@pytest.fixture
+def swarm_medium(run, capsys):
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "300d", "--site", "swarm")
+    capsys.readouterr()
+    return run
+
+
+def test_import_swarm_records_the_reference_alongside_the_hash(
+        swarm_medium, db, tmp_path, capsys):
+    """Content hash stays the identity; the Swarm reference is an address on
+    one medium, and storing it is what makes the copy checkable later
+    without downloading it again."""
+    listing = swarm_listing_file(tmp_path, [
+        {"path": "photos/holiday.jpg", "size": 6, "reference": "abc123"},
+    ])
+    swarm_medium("import-swarm", "swarm", listing)
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        path, ref, evidence, verified = c.execute(
+            "SELECT path, external_ref, evidence, verified_at FROM instances"
+        ).fetchone()
+    assert path == "photos/holiday.jpg"
+    assert ref == "abc123"
+    assert evidence == "imported" and verified is None
+
+
+def test_import_swarm_matches_content_already_known_by_hash(
+        run, db, tmp_path, capsys):
+    """Unambiguous name+size gets the real hash, so the copy counts."""
+    src = tmp_path / "src"
+    write(src / "holiday.jpg", "photo!")          # 6 bytes
+    run("add-medium", "laptop", "--kind", "laptop")
+    run("scan", "laptop", str(src))
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "300d")
+    listing = swarm_listing_file(tmp_path, [
+        {"path": "holiday.jpg", "size": 6, "reference": "deadbeef"}])
+    run("import-swarm", "swarm", listing)
+    out = capsys.readouterr().out
+    assert "1 matched to content already known by hash" in out
+    with sqlite3.connect(db) as c:
+        hashes = {h for h, in c.execute("SELECT hash FROM instances")}
+    assert len(hashes) == 1 and hashes.pop().startswith("sha256:")
+
+
+def test_unmatched_entries_are_marked_unverified_not_invented(
+        swarm_medium, db, tmp_path, capsys):
+    """A listing proves paths and sizes, never bytes."""
+    listing = swarm_listing_file(tmp_path, [
+        {"path": "mystery.bin", "size": 999, "reference": "ref"}])
+    swarm_medium("import-swarm", "swarm", listing)
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        h = c.execute("SELECT hash FROM instances").fetchone()[0]
+    assert h.startswith("unverified:swarm:")
+
+
+def test_a_swarm_medium_counts_as_a_leased_backup(run, db, tmp_path, capsys):
+    src = tmp_path / "src"
+    write(src / "a.txt", "aaa")
+    run("add-medium", "laptop", "--kind", "laptop")
+    run("scan", "laptop", str(src))
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "300d")
+    run("import-swarm", "swarm",
+        swarm_listing_file(tmp_path, [
+            {"path": "a.txt", "size": 3, "reference": "r"}]))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT backup_copies FROM content"
+                         ).fetchone()[0] == 1
+    run("redundancy", "--min-copies", "1", "--exit-code")     # no raise
+
+
+def test_a_lapsed_swarm_lease_stops_counting(run, db, tmp_path, capsys):
+    """The whole reason Swarm needed the lease machinery first."""
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "300d")
+    run("import-swarm", "swarm",
+        swarm_listing_file(tmp_path, [
+            {"path": "a.txt", "size": 3, "reference": "r"}]))
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE media SET lease_expires=?", (time.time() - 86400,))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "1", "--exit-code")
+    assert "lapsed" in capsys.readouterr().err
+
+
+def test_re_importing_prunes_what_is_no_longer_there(swarm_medium, db,
+                                                     tmp_path, capsys):
+    swarm_medium("import-swarm", "swarm", swarm_listing_file(tmp_path, [
+        {"path": "a.txt", "size": 1, "reference": "r1"},
+        {"path": "b.txt", "size": 2, "reference": "r2"}]))
+    swarm_medium("import-swarm", "swarm", swarm_listing_file(tmp_path, [
+        {"path": "a.txt", "size": 1, "reference": "r1"}]))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert {p for p, in c.execute("SELECT path FROM instances")} \
+            == {"a.txt"}
+
+
+def test_import_swarm_refuses_an_unregistered_medium(run, tmp_path):
+    with pytest.raises(SystemExit) as e:
+        run("import-swarm", "nope",
+            swarm_listing_file(tmp_path, [{"path": "a", "size": 1}]))
+    assert "register it first" in str(e.value)
+
+
+def test_listing_a_root_without_the_extra_says_how_to_install(
+        swarm_medium, monkeypatch):
+    no_swarmlite_import(monkeypatch, "fsspec")
+    with pytest.raises(SystemExit) as e:
+        swarm_medium("import-swarm", "swarm", "--root", "deadbeef")
+    assert "holdings[swarm]" in str(e.value)
+
+
+def test_lease_from_batch_without_the_extra_says_how_to_install(
+        run, monkeypatch):
+    no_swarmlite_import(monkeypatch, "swarmlite")
+    with pytest.raises(SystemExit) as e:
+        run("add-medium", "s", "--kind", "cloud", "--durability", "leased",
+            "--lease-from-batch", "abc123")
+    assert "holdings[swarm]" in str(e.value)
+
+
+def no_swarmlite_import(monkeypatch, name):
+    """Simulate one optional dependency being absent, whether or not it is."""
+    import builtins
+    real = builtins.__import__
+
+    def fake(mod, *a, **k):
+        if mod == name:
+            raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+        return real(mod, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake)
