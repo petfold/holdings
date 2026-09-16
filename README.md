@@ -14,9 +14,13 @@ belong to OntoDAG (see *Projection contract* below).
    *human* OntoDAG categorization — which holdings never touches.
 3. **Content hash is identity.** `sha256:…` is the primary key everywhere.
    Paths, media, snapshots, categories: all attributes of a hash.
-4. **Single writer, many readers.** Scan on the backup-node laptop. Put the
-   SQLite file in a Syncthing folder; every device then carries the full
-   index of everything — including drives offline in another country.
+4. **Single writer, many readers.** Scan on the backup-node laptop; every
+   other device only reads. How the catalog reaches them is *not* part of
+   the contract — put the SQLite file in a synced folder (Syncthing, or
+   anything else) and every device carries the full index of everything,
+   including drives offline in another country. Or publish it read-only
+   and have them query it without holding it at all (see *Reading a
+   published catalog*, below). Both work; neither is required.
 
 ## Quick start
 
@@ -55,6 +59,54 @@ restic -r b2:bucket:repo ls --json latest | ./holdings.py import-restic restic-b
 `only-on` is the consolidation to-do list for old scattered drives: run it,
 back those files up via restic, rescan, watch the list empty, then wipe the
 drive with confidence.
+
+## Reading a published catalog (optional)
+
+The catalog is a path, so distributing it is someone else's job — and the
+default, a file in a synced folder, needs nothing installed. The alternative
+is to publish it read-only and let other devices *query* it instead of
+carrying it:
+
+```bash
+pip install 'holdings[swarm]'        # optional; a local catalog needs no extra
+
+# On the scanning laptop, after a scan — publishing is a separate tool:
+swarmlite publish ~/catalog.sqlite --encrypt --feed holdings --signer $KEY
+
+# Anywhere else, with no copy of the file and no device pairing:
+holdings --db bzzf://<owner>/holdings/catalog.sqlite whereis holiday.jpg
+```
+
+[swarmlite](https://github.com/petfold/swarmlite) maps SQLite's 4 KB pages
+onto Swarm range reads, so an indexed lookup fetches a handful of pages
+rather than the catalog — a phone can answer `whereis` against a laptop that
+has been shut for a week. `--encrypt` matters: a catalog carries filenames,
+sizes and location hints, and the published root becomes the secret.
+
+Two things this deliberately is not:
+
+* **Not required.** `pip install holdings` stays stdlib-only and complete.
+  The reader is imported lazily and only when a `--db` URL asks for it, so
+  a local catalog never pays for it and someone who never wants Swarm sees
+  none of it.
+* **Not a write path.** Published catalogs are read-only; `add-medium`,
+  `scan` and `import-restic` refuse a URL and point back at the local file.
+  Single-writer is the design contract, not a limitation of the transport.
+
+Worth knowing before leaning on it. Measured against a live Bee node on a
+125 MB catalog (120k files, 300k placements), cold cache each time:
+
+| query | pages | fetched |
+|---|---|---|
+| `whereis sha256:…` | 17 | 0.06% |
+| `whereis <full path>` | 8 | 0.03% |
+| `whereis <bare filename>` | — | did not finish in 8 min |
+| `redundancy`, `only-on`, `stats`, `media` | — | did not finish in 8 min |
+
+So the hash- and path-keyed lookups are what this is good for today. A bare
+filename falls back to `path LIKE '%/name'`, which no index can serve, and
+the reports are full scans — both are roadmap items ([ROADMAP.md](ROADMAP.md))
+and both are worth fixing locally regardless of Swarm.
 
 ## Projection contract (OntoDAG integration)
 
@@ -97,7 +149,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **46 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **64 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

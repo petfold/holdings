@@ -536,3 +536,160 @@ def test_human_size(n, expected):
 def test_human_size_keeps_bytes_whole_and_scales_with_one_decimal():
     assert holdings.human_size(1023) == "1023B"      # no decimal below 1 KB
     assert holdings.human_size(1024) == "1.0KB"      # one decimal above
+
+
+# --------------------------------------------------- published catalogs (opt)
+
+# The optional read path: a catalog published read-only and opened by URL.
+# What holdings owns here is the dispatch — which paths are URLs, which
+# commands may run against one, and what someone without the extra is told.
+# The reader itself is swarmlite's.
+
+def fake_swarmlite(monkeypatch, db_path):
+    """Stand in for the extra, so the dispatch is testable without it.
+
+    `connect` returns a genuinely read-only sqlite3 connection over the
+    local file, which is the contract holdings relies on, and records the
+    URL it was asked for.
+    """
+    import types
+    seen = {}
+
+    def connect(url, **kwargs):
+        seen["url"] = url
+        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+    monkeypatch.setitem(sys.modules, "swarmlite",
+                        types.SimpleNamespace(connect=connect))
+    return seen
+
+
+def no_swarmlite(monkeypatch):
+    """Simulate the extra not being installed, whether or not it is."""
+    import builtins
+    real = builtins.__import__
+
+    def fake(name, *a, **k):
+        if name == "swarmlite":
+            raise ModuleNotFoundError("No module named 'swarmlite'",
+                                      name="swarmlite")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake)
+
+
+@pytest.mark.parametrize("db,remote", [
+    ("bzz://abc/catalog.sqlite", True),
+    ("bzzf://owner/topic/catalog.sqlite", True),
+    ("file:///srv/catalog.sqlite", True),
+    ("memory://catalog.sqlite", True),
+    ("/home/peter/catalog.sqlite", False),
+    ("catalog.sqlite", False),
+    ("./bzz/catalog.sqlite", False),        # a directory named bzz is a path
+    ("~/Sync/catalog/catalog.sqlite", False),
+])
+def test_only_url_forms_are_treated_as_published_catalogs(db, remote):
+    assert holdings.is_remote_url(db) is remote
+
+
+def test_every_command_declares_whether_it_writes():
+    """A new subcommand must say which side of the line it is on.
+
+    Without this, one added later inherits no `writes` default and fails at
+    dispatch — or worse, is quietly allowed to write to a read-only catalog.
+    """
+    import argparse
+    p = holdings.build_parser()
+    [subs] = [a for a in p._actions
+              if isinstance(a, argparse._SubParsersAction)]
+    undeclared = [name for name, sp in subs.choices.items()
+                  if sp.get_default("writes") is None]
+    assert not undeclared, f"commands not declaring writes=: {undeclared}"
+
+
+def test_the_commands_that_write_are_the_ones_that_change_placement():
+    """Pins the split itself, so a read command cannot silently become one
+    that writes (which would then be refused against a published catalog)."""
+    import argparse
+    [subs] = [a for a in holdings.build_parser()._actions
+              if isinstance(a, argparse._SubParsersAction)]
+    writers = {n for n, sp in subs.choices.items() if sp.get_default("writes")}
+    assert writers == {"add-medium", "scan", "import-restic"}
+
+
+@pytest.mark.parametrize("argv", [
+    ["add-medium", "d", "--kind", "drive"],
+    ["scan", "d", "/tmp"],
+    ["import-restic", "r", "-"],
+])
+def test_writing_commands_refuse_a_published_catalog(argv, capsys, monkeypatch):
+    """Published catalogs are read-only; the error points at the real route."""
+    fake_swarmlite(monkeypatch, "/nonexistent.sqlite")
+    with pytest.raises(SystemExit) as e:
+        holdings.main(["--db", "bzzf://owner/holdings/catalog.sqlite", *argv])
+    msg = str(e.value)
+    assert "read-only" in msg and "swarmlite publish" in msg
+
+
+def test_reading_a_published_catalog_without_the_extra_says_how_to_install(
+        monkeypatch):
+    no_swarmlite(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        holdings.main(["--db", "bzz://deadbeef/catalog.sqlite", "stats"])
+    assert "holdings[swarm]" in str(e.value)
+
+
+def test_a_local_catalog_never_imports_the_extra(run, monkeypatch, tmp_path):
+    """The contract: stdlib only unless you explicitly ask for a URL."""
+    no_swarmlite(monkeypatch)
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    run("stats")            # would raise if the extra were on the local path
+
+
+def test_read_commands_work_against_a_published_catalog(db, run, monkeypatch,
+                                                        tmp_path, capsys):
+    """The catalog is built locally, then read back through the URL path."""
+    root = tmp_path / "disk"
+    write(root / "holiday.jpg", "photo")
+    run("add-medium", "drive-budapest", "--kind", "drive", "--backup")
+    run("scan", "drive-budapest", str(root))
+    capsys.readouterr()
+
+    url = "bzzf://owner/holdings/catalog.sqlite"
+    seen = fake_swarmlite(monkeypatch, db)
+    holdings.main(["--db", url, "whereis", "holiday.jpg"])
+    out = capsys.readouterr().out
+    assert seen["url"] == url          # dispatched, not opened as a path
+    assert "drive-budapest" in out
+
+
+def test_file_url_over_a_live_catalog_warns_that_the_wal_is_invisible(
+        db, run, monkeypatch, tmp_path, capsys):
+    """Measured against real swarmlite: its read-only VFS reports the WAL
+    absent, so an un-checkpointed write is silently missing. Right for a
+    published artifact (publishing checkpoints first), wrong to pass on in
+    silence for a `file://` read of a live catalog."""
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    Path(db + "-wal").write_bytes(b"\x00" * 64)     # a writer's sidecar
+    capsys.readouterr()
+
+    fake_swarmlite(monkeypatch, db)
+    holdings.main(["--db", f"file://{db}", "stats"])
+    assert "WAL are invisible" in capsys.readouterr().err
+
+
+def test_no_wal_warning_when_there_is_nothing_uncheckpointed(
+        db, run, monkeypatch, tmp_path, capsys):
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    capsys.readouterr()
+
+    fake_swarmlite(monkeypatch, db)
+    holdings.main(["--db", f"file://{db}", "stats"])
+    assert capsys.readouterr().err == ""
+

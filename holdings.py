@@ -9,7 +9,9 @@ Design principles (see the accompanying README):
   * Content hash (sha256) is the primary key. Paths, media, and
     categories are attributes of a hash, never identities.
   * Single writer (your backup-node laptop), many readers (the SQLite
-    file can be placed in a Syncthing folder and read anywhere).
+    file can be placed in a synced folder, or published read-only, and
+    read anywhere). How it travels is not this tool's business: the
+    catalog is a path, and everything below works on a local file.
   * Placement truth lives here, in SQLite. Semantic truth lives in
     OntoDAG. The `project-ontodag` command emits placement facts as a
     namespaced (`sys:`) projection for OntoDAG to ingest as a
@@ -64,6 +66,10 @@ CREATE TABLE IF NOT EXISTS instances (
     PRIMARY KEY (medium_id, path)
 );
 CREATE INDEX IF NOT EXISTS idx_instances_hash ON instances(hash);
+-- The primary key is (medium_id, path), so a lookup by path alone --
+-- `whereis <path>`, the commonest query there is -- would otherwise
+-- scan every instance. Cheap locally, ruinous over a network.
+CREATE INDEX IF NOT EXISTS idx_instances_path ON instances(path);
 
 CREATE TABLE IF NOT EXISTS scans (
     scan_id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,6 +84,7 @@ CREATE TABLE IF NOT EXISTS scans (
 """
 
 
+
 def db_connect(db_path: str) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -85,6 +92,88 @@ def db_connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
     return conn
+
+
+# --------------------------------------------------------------------------
+# Published catalogs (optional)
+# --------------------------------------------------------------------------
+
+# A catalog is normally a local file. It can also be *published* read-only and
+# opened by URL, which is what lets a phone or a second laptop answer `whereis`
+# without holding the file or pairing with anything. This is an optional extra
+# (`pip install 'holdings[swarm]'`): nothing here is imported, installed or
+# required for a local catalog, which remains the default and complete path.
+#
+# `bzz://` pins an immutable version, `bzzf://` follows a feed to the latest.
+# `file://` and `memory://` are swarmlite's own local forms — the identical
+# code path with no node involved, which is how to try the read path (or read
+# a local catalog strictly read-only) before publishing anything.
+REMOTE_SCHEMES = ("bzz://", "bzzf://", "file://", "memory://")
+
+_WRITE_ON_PUBLISHED = """\
+A published catalog is read-only. Placement is written where the scanning
+happens, and published afterwards:
+    holdings --db <local.sqlite> {cmd} ...
+    swarmlite publish <local.sqlite> --encrypt --feed holdings"""
+
+
+def is_remote_url(db: str) -> bool:
+    return db.startswith(REMOTE_SCHEMES)
+
+
+def warn_if_uncheckpointed(url: str) -> None:
+    """A `file://` read ignores an un-checkpointed WAL, silently.
+
+    swarmlite's read-only VFS reports the WAL absent. That is right for a
+    published artifact — `swarmlite publish` checkpoints into
+    journal_mode=DELETE first, so `bzz://` and `bzzf://` are always whole —
+    but a `file://` URL can point at a live catalog with a writer's sidecar
+    beside it. Measured: an insert sitting in the WAL is simply not there.
+    Staleness in a placement catalog reads as "no backup exists", which is
+    the one wrong answer this tool must not give quietly.
+    """
+    if not url.startswith("file://"):
+        return
+    wal = Path(url[len("file://"):] + "-wal")
+    try:
+        empty = wal.stat().st_size == 0
+    except OSError:
+        return
+    if not empty:
+        print(f"warning: '{wal.name}' is present, so this reads the last"
+              f" checkpointed state — writes still in the WAL are invisible."
+              f" Close the writer first (or publish, which checkpoints).",
+              file=sys.stderr)
+
+
+def remote_connect(url: str):
+    """Open a published catalog read-only, via swarmlite.
+
+    swarmlite maps SQLite's 4 KB pages onto ranged reads, so an indexed
+    lookup such as `whereis` fetches a handful of pages rather than the
+    whole catalog. The import is deliberately lazy and deliberately late:
+    a local catalog never pays for it, and a machine without the extra
+    only ever meets this error by explicitly asking for a URL.
+    """
+    try:
+        import swarmlite
+    except ModuleNotFoundError:
+        sys.exit(f"opening '{url}' needs the optional published-catalog"
+                 f" reader:\n"
+                 f"    pip install 'holdings[swarm]'\n"
+                 f"A local catalog file needs nothing beyond the stdlib.")
+    warn_if_uncheckpointed(url)
+    return swarmlite.connect(url)
+
+
+def open_catalog(db: str, *, writes: bool, cmd: str):
+    """Connect to a catalog, local or published, per the `--db` path given."""
+    if not is_remote_url(db):
+        return db_connect(db)
+    if writes:
+        sys.exit(f"'{cmd}' writes to the catalog, but '{db}' is published.\n"
+                 + _WRITE_ON_PUBLISHED.format(cmd=cmd))
+    return remote_connect(db)
 
 
 # --------------------------------------------------------------------------
@@ -513,14 +602,15 @@ def human_size(n) -> str:
 # CLI wiring
 # --------------------------------------------------------------------------
 
-def main(argv=None):
+def build_parser():
     p = argparse.ArgumentParser(
         prog="holdings",
         description="Catalog of which media hold which files."
                     " Placement truth in SQLite; semantics belong to OntoDAG.")
     p.add_argument("--db", default=DEFAULT_DB,
-                   help=f"catalog database (default {DEFAULT_DB};"
-                        f" put it in a Syncthing folder to read it everywhere)")
+                   help=f"catalog database (default {DEFAULT_DB}); a path,"
+                        f" or a published read-only catalog as a"
+                        f" bzz://|bzzf:// URL (needs holdings[swarm])")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("add-medium", help="register a medium")
@@ -532,10 +622,10 @@ def main(argv=None):
     s.add_argument("--backup", action="store_true",
                    help="counts toward backup redundancy")
     s.add_argument("--notes")
-    s.set_defaults(func=cmd_add_medium)
+    s.set_defaults(func=cmd_add_medium, writes=True)
 
     s = sub.add_parser("media", help="list media")
-    s.set_defaults(func=cmd_media)
+    s.set_defaults(func=cmd_media, writes=False)
 
     s = sub.add_parser("scan", help="scan a mounted medium (or subtree)")
     s.add_argument("medium_id")
@@ -544,44 +634,48 @@ def main(argv=None):
     s.add_argument("--exclude-file", help="extra exclude patterns, one per line")
     s.add_argument("--full", action="store_true",
                    help="rehash everything (ignore mtime+size shortcut)")
-    s.set_defaults(func=cmd_scan)
+    s.set_defaults(func=cmd_scan, writes=True)
 
     s = sub.add_parser("import-restic",
                        help="ingest `restic ls --json` output ('-' = stdin)")
     s.add_argument("medium_id")
     s.add_argument("listing")
-    s.set_defaults(func=cmd_import_restic)
+    s.set_defaults(func=cmd_import_restic, writes=True)
 
     s = sub.add_parser("whereis", help="which media hold this file?")
     s.add_argument("target", help="path, filename, or sha256:... hash")
-    s.set_defaults(func=cmd_whereis)
+    s.set_defaults(func=cmd_whereis, writes=False)
 
     s = sub.add_parser("redundancy", help="content below N backup copies")
     s.add_argument("--min-copies", type=int, default=2)
     s.add_argument("--limit", type=int, default=40)
-    s.set_defaults(func=cmd_redundancy)
+    s.set_defaults(func=cmd_redundancy, writes=False)
 
     s = sub.add_parser("diff", help="on A but not on B")
     s.add_argument("medium_a")
     s.add_argument("medium_b")
     s.add_argument("--limit", type=int, default=40)
-    s.set_defaults(func=cmd_diff)
+    s.set_defaults(func=cmd_diff, writes=False)
 
     s = sub.add_parser("only-on", help="content that exists ONLY on this medium")
     s.add_argument("medium_id")
     s.add_argument("--limit", type=int, default=40)
-    s.set_defaults(func=cmd_only_on)
+    s.set_defaults(func=cmd_only_on, writes=False)
 
     s = sub.add_parser("stats", help="catalog totals")
-    s.set_defaults(func=cmd_stats)
+    s.set_defaults(func=cmd_stats, writes=False)
 
     s = sub.add_parser("project-ontodag",
                        help="emit sys: placement projection (JSON lines)")
     s.add_argument("--out", default="-")
-    s.set_defaults(func=cmd_project_ontodag)
+    s.set_defaults(func=cmd_project_ontodag, writes=False)
 
-    args = p.parse_args(argv)
-    conn = db_connect(args.db)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    conn = open_catalog(args.db, writes=args.writes, cmd=args.cmd)
     try:
         args.func(conn, args)
     finally:
