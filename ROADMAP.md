@@ -100,26 +100,78 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
       precomputation removes. Acceptable locally; expensive over a network.
       If it ever matters, it wants a per-pair summary rather than a better
       index.
-- [ ] **Warn on a stale published catalog.** `swarmlite publish` checkpoints
-      WAL into the artifact, so `bzz://` and `bzzf://` are always whole; but
-      a `file://` read of a live catalog silently skips an un-checkpointed
-      WAL (measured: an inserted medium was simply absent). holdings now
-      warns when the sidecar is present — see whether the same class of
-      staleness needs saying for a feed that has not been republished since
-      the last scan.
-- [ ] **Publish-side runbook**: `swarmlite publish --encrypt` after a scan
-      (the catalog carries filenames, sizes and location hints, so the
-      published root is the secret), and `swarmlite stamps --check
-      --min-ttl` on a timer. Expiry is survivable here precisely because the
-      local file is authoritative and the catalog is regenerable — the
-      failure mode is staleness, which the contract already permits.
-- [ ] **Swarm as a *medium*** — a different thing from transport: content
-      published to Swarm counted as a backup copy by `redundancy`. Needs a
-      `sha256 → swarm reference` mapping (a by-product of publishing, so
-      exact, unlike `import-restic`'s basename+size matching) and a notion
-      of a *leased* copy: a postage batch with three weeks left and a drive
-      in a safe are not the same kind of copy, and `--min-copies` cannot say
-      so today.
+- [x] **Warn on a stale published catalog** (DONE 2026-09-16). A synced
+      folder refreshes itself; a pin never does and a feed only moves when
+      someone republishes, so a reader can be looking at months-old
+      placement with nothing on screen to say so. Reads of a published
+      catalog now warn when its newest scan is older than `--max-scan-age`
+      (default 30 days). Note this measures *scan* age, not publication
+      age: the obvious check — the feed's last update against the catalog's
+      newest scan — says nothing, because a catalog is always written
+      before it is published, so that gap is small and reassuring even when
+      the writer stopped scanning a year ago. A reader genuinely cannot
+      detect "scanned but not published"; only the writer can, which is why
+      that half lives in the runbook as a habit rather than a check.
+- [x] **Publish-side runbook** (DONE 2026-09-16):
+      [docs/PUBLISHING.md](docs/PUBLISHING.md) — the scan/publish loop, why
+      `--encrypt` is not optional for a file carrying filenames and location
+      hints, feeds versus pins, postage renewal as a cron line, and what a
+      lapsed batch does and does not cost.
+- [ ] **What does a copy survive?** — the modelling problem underneath
+      several requested features, filed once rather than per backend.
+
+      `is_backup` is a single boolean standing in for a question with
+      several different answers. Each kind of copy fails its own way:
+
+      | fails by | meaning | examples |
+      |---|---|---|
+      | event | it breaks, is lost or stolen | drive, laptop |
+      | inaction | it lapses on a schedule unless renewed | Swarm postage |
+      | propagation | your deletion reaches it | Syncthing, Dropbox, Drive |
+      | scope | it only ever held part of the tree | any git remote |
+      | participation | it exists while someone volunteers to host it | Radicle seeds |
+      | custodian | one party can remove it unilaterally | GitHub, Hugging Face |
+      | access | present, but hours from readable | Glacier, cold tiers |
+
+      Today `--backup` asserts "event" and nothing else, and the README now
+      says so. The fix is a small vocabulary of durability classes with
+      `is_backup` derived from it, so `redundancy` can answer "two copies,
+      one of which evaporates in three weeks" and `only-on` can stop
+      counting a sync mirror as somewhere else.
+
+      Cases, in the order they are worth doing:
+
+      * **Leased copies (Swarm).** Store the expiry estimate **and** when it
+        was taken. A node's TTL comes from the batch balance at the
+        *current* storage price; if the price rises the batch drains faster
+        than quoted, so it is an optimistic bound that also goes stale where
+        it sits — "18 days left", recorded four months ago, is an expired
+        lease. Read it conservatively, and never count a lease that is about
+        to lapse. The `sha256 → swarm reference` mapping is a by-product of
+        publishing, so placement is exact, unlike `import-restic`'s
+        basename+size matching.
+      * **Sync mirrors.** Scannable as a path today, which is exactly the
+        risk: nothing stops `--backup`. Wants a class that `redundancy`
+        discounts and `only-on` does not treat as elsewhere.
+      * **A generic listing importer.** restic, S3/B2, rclone and Swarm are
+        one shape — a listing of paths and sizes — not four readers.
+        Hashes are approximate unless you controlled the upload, in which
+        case they are exact.
+      * **Hubs (GitHub, Hugging Face, Radicle).** Needs git-awareness, not
+        a directory scan: only content that is committed *and* pushed *and*
+        still reachable from a remote ref is there, which excludes precisely
+        the files someone is working on. Doing it as a scan would
+        systematically overstate redundancy. `.git` is in the default
+        excludes, so holdings currently sees working trees and no history.
+
+        Radicle differs from the others in a way worth modelling rather than
+        flattening: no custodian who can close your account, but
+        availability is the sum of voluntary seeds, so the countable thing
+        is **seeds other than your own**. A repo seeded only by your own
+        node is not a second copy. That is the same uptime-dependence that
+        makes peer-to-peer sync need overlapping availability — the problem
+        publishing to Swarm was adopted to avoid — so the two should not be
+        given the same class.
 
 ## Future — the browser
 

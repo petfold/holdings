@@ -1024,3 +1024,73 @@ def test_only_here_drift_is_detected(run, db, capsys, tmp_path):
     with pytest.raises(SystemExit):
         run("check")
     assert "only_here" in capsys.readouterr().err
+
+
+# ------------------------------------------------- published catalog age
+
+def age_catalog(db, days):
+    """Backdate every medium's last scan."""
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE media SET last_scanned=?",
+                  (time.time() - days * 86400,))
+
+
+def test_an_old_published_catalog_says_so(db, run, monkeypatch, tmp_path,
+                                          capsys):
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    age_catalog(db, 200)
+    capsys.readouterr()
+
+    fake_swarmlite(monkeypatch, db)
+    holdings.main(["--db", "bzzf://o/holdings/c.sqlite", "stats"])
+    err = capsys.readouterr().err
+    assert "has been scanned since" in err and "200 days ago" in err
+
+
+def test_a_recent_published_catalog_is_quiet(db, run, monkeypatch, tmp_path,
+                                             capsys):
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    age_catalog(db, 3)
+    capsys.readouterr()
+
+    fake_swarmlite(monkeypatch, db)
+    holdings.main(["--db", "bzzf://o/holdings/c.sqlite", "stats"])
+    assert capsys.readouterr().err == ""
+
+
+def test_the_staleness_warning_can_be_silenced(db, run, monkeypatch, tmp_path,
+                                               capsys):
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    age_catalog(db, 900)
+    capsys.readouterr()
+
+    fake_swarmlite(monkeypatch, db)
+    holdings.main(["--db", "bzzf://o/holdings/c.sqlite",
+                   "--max-scan-age", "0", "stats"])
+    assert capsys.readouterr().err == ""
+
+
+def test_a_local_catalog_is_not_nagged_about_its_age(db, run, tmp_path,
+                                                     capsys):
+    """Whoever holds the local file is the one who would rescan; the warning
+    is for readers who cannot."""
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(tmp_path / "disk"))
+    age_catalog(db, 900)
+    capsys.readouterr()
+    run("stats")
+    assert capsys.readouterr().err == ""
+
+
+def test_an_empty_published_catalog_does_not_warn(db, monkeypatch, capsys):
+    holdings.db_connect(db).close()              # schema only, no media
+    fake_swarmlite(monkeypatch, db)
+    holdings.main(["--db", "bzzf://o/holdings/c.sqlite", "stats"])
+    assert capsys.readouterr().err == ""
