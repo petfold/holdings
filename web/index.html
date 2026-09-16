@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>holdings</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>&#128190;</text></svg>">
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1a1a18; --dim: #6b6b64; --line: #e2e2dd;
+    --card: #fff; --accent: #4a5d3a; --warn: #8a5a2b; --danger: #9b3232;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #16171a; --fg: #e8e8e4; --dim: #9a9a92; --line: #2c2e33;
+      --card: #1d1f23; --accent: #a3c27e; --warn: #d9a05b; --danger: #e0736f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #16171a; --fg: #e8e8e4; --dim: #9a9a92; --line: #2c2e33;
+    --card: #1d1f23; --accent: #a3c27e; --warn: #d9a05b; --danger: #e0736f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 20px; }
+  h1 { font-size: 20px; margin: 0 0 2px; letter-spacing: -0.01em; }
+  h1 small { font-weight: 400; color: var(--dim); font-size: 13px; margin-left: 8px; }
+  .totals { color: var(--dim); font-size: 13px; }
+  .stale {
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+    border: 1px solid var(--warn); color: var(--warn);
+    padding: 8px 12px; border-radius: 6px; margin: 12px 0; font-size: 13px;
+  }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 16px; }
+  nav button {
+    font: inherit; font-size: 14px; padding: 6px 12px; cursor: pointer;
+    background: transparent; color: var(--dim);
+    border: 1px solid transparent; border-radius: 6px;
+  }
+  nav button[aria-selected="true"] {
+    background: var(--card); color: var(--fg); border-color: var(--line);
+  }
+  .panel { display: none; }
+  .panel.on { display: block; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  input, select {
+    font: inherit; padding: 7px 10px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--card); color: var(--fg); min-width: 0;
+  }
+  input[type=search] { flex: 1 1 260px; }
+  button.go {
+    font: inherit; padding: 7px 14px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent); color: var(--bg);
+  }
+  /* Tables scroll sideways rather than clipping. Measured: the media
+     table needs 365px and a 390px phone gives the content box 326, so
+     without this the first view someone sees is cut off. */
+  .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; min-width: max-content; border-collapse: collapse;
+          font-size: 14px; }
+  th, td { text-align: left; padding: 7px 10px 7px 0; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 500; font-size: 12px;
+       text-transform: uppercase; letter-spacing: 0.04em; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .path, .hash { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+  .tag {
+    font-size: 11px; padding: 1px 6px; border-radius: 10px;
+    border: 1px solid var(--line); color: var(--dim);
+  }
+  .tag.backup { color: var(--accent); border-color: var(--accent); }
+  .tag.danger { color: var(--danger); border-color: var(--danger); }
+  .note { color: var(--dim); font-size: 13px; margin: 10px 0; }
+  .danger-note { color: var(--danger); }
+  footer {
+    margin-top: 28px; padding-top: 12px; border-top: 1px solid var(--line);
+    color: var(--dim); font-size: 12px; font-family: var(--mono);
+  }
+  code { font-family: var(--mono); font-size: 0.92em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>holdings <small id="source">connecting…</small></h1>
+    <div class="totals" id="totals"></div>
+  </header>
+
+  <div id="stale" class="stale" hidden></div>
+
+  <nav id="tabs">
+    <button data-panel="media" aria-selected="true">Media</button>
+    <button data-panel="whereis" aria-selected="false">Where is…</button>
+    <button data-panel="redundancy" aria-selected="false">Redundancy</button>
+    <button data-panel="onlyon" aria-selected="false">Only on…</button>
+  </nav>
+
+  <section class="panel on" id="panel-media">
+    <div id="media-out"></div>
+  </section>
+
+  <section class="panel" id="panel-whereis">
+    <form id="whereis-form">
+      <input type="search" id="whereis-q" placeholder="filename, path, or sha256:… hash"
+             autocomplete="off" spellcheck="false">
+      <button class="go" type="submit">Find</button>
+    </form>
+    <div id="whereis-out"></div>
+  </section>
+
+  <section class="panel" id="panel-redundancy">
+    <form id="redundancy-form">
+      <label class="note">fewer than
+        <input type="number" id="min-copies" value="2" min="1" max="9" style="width:4.5em">
+        backup copies</label>
+      <button class="go" type="submit">Check</button>
+    </form>
+    <div id="redundancy-out"></div>
+  </section>
+
+  <section class="panel" id="panel-onlyon">
+    <form id="onlyon-form">
+      <select id="onlyon-medium"></select>
+      <button class="go" type="submit">List</button>
+    </form>
+    <p class="note danger-note">Content held on this medium and nowhere else.
+      Everything here is lost if this medium is.</p>
+    <div id="onlyon-out"></div>
+  </section>
+
+  <footer id="economy">read-only · nothing is sent anywhere</footer>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

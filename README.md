@@ -151,6 +151,39 @@ the same query across runs), so pages are the honest measure.
 to ask "does B hold this too?" once per file, and no amount of precomputation
 removes that. Fine locally, expensive over a network.
 
+## The browser viewer (optional)
+
+`web/` is a read-only viewer for a published catalog: media, `whereis`,
+`redundancy` and `only-on` in a page with no server, no install and no
+account. It is the same lazy-page trick as the CLI's Swarm reader, in
+SQLite-WASM — so opening it does not download the catalog.
+
+```bash
+# The catalog follows a feed; the site is published once and stays put:
+python web/publish.py --feed <owner-hex>/holdings
+# Or freeze page, reader, wasm and catalog under one immutable root:
+python web/publish.py --catalog ~/catalog.sqlite
+```
+
+Measured on the same 157 MB catalog, cold each time:
+
+| in the page | pages fetched | of the file |
+|---|---|---|
+| opening it (media + totals) | 5 | 0.014% |
+| `whereis` a bare filename | 20 | 0.056% |
+| redundancy below 2 copies | 56 | 0.158% |
+| only-on for one medium | 71 | 0.200% |
+
+Identical to the CLI's counts, because it is the same SQL: `web/queries.json`
+is generated from `holdings.QUERIES` and a test fails if the committed copy
+disagrees. The viewer cannot quietly answer a different question from the
+CLI — which matters, since every one of those report queries was rewritten
+once already.
+
+There is no write path in the page at all: `add-medium`, `scan` and
+`import-restic` do not exist there, and the publisher does not ship
+swarmlite's JS writer alongside the reader.
+
 ## Projection contract (OntoDAG integration)
 
 *(2026-08-20: this contract's canonical statement now lives at the meet
@@ -192,7 +225,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **86 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **88 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

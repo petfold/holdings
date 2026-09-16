@@ -290,7 +290,7 @@ def warn_if_stale(conn, max_age_days: float) -> None:
     """
     if max_age_days <= 0:
         return
-    newest = conn.execute("SELECT MAX(last_scanned) FROM media").fetchone()[0]
+    newest = conn.execute(QUERIES["newest_scan"]).fetchone()[0]
     if newest is None:
         return
     age = (time.time() - newest) / 86400
@@ -357,6 +357,58 @@ def is_excluded(rel_path: str, name: str, patterns: list[str]) -> bool:
         if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(rel_path, pat):
             return True
     return False
+
+
+# --------------------------------------------------------------------------
+# The read queries
+# --------------------------------------------------------------------------
+
+# Named once because there is now more than one reader. The browser viewer
+# (web/) runs these same strings against the same published file, and every
+# report query here has already been rewritten once -- when the aggregates
+# moved to write time -- so a second copy of the SQL would have silently
+# drifted that day. `web/queries.json` is generated from this dict and a
+# test fails if the committed copy disagrees.
+#
+# Read-only by construction: nothing here writes, which is what makes them
+# safe to hand to a reader that has no write path at all.
+QUERIES = {
+    "media":
+        "SELECT medium_id, kind, is_backup, location_hint, last_scanned,"
+        "       file_count, byte_count, only_here_count, only_here_bytes"
+        " FROM media ORDER BY medium_id",
+    "summary":
+        "SELECT content_count, content_bytes, instance_count"
+        " FROM catalog_summary WHERE id=1",
+    "media_count":
+        "SELECT COUNT(*) AS n FROM media",
+    "resolve_by_path":
+        "SELECT hash FROM instances WHERE path=? LIMIT 1",
+    "resolve_by_name":
+        "SELECT DISTINCT hash FROM instances WHERE name=? LIMIT 2",
+    "content_size":
+        "SELECT size FROM content WHERE hash=?",
+    "placements":
+        "SELECT i.medium_id, m.kind, m.is_backup, i.path, i.seen_at,"
+        "       m.location_hint"
+        " FROM instances i JOIN media m ON m.medium_id=i.medium_id"
+        " WHERE i.hash=? ORDER BY m.is_backup DESC, i.medium_id",
+    "redundancy_rows":
+        "SELECT hash, size, backup_copies, copies, example_path FROM content"
+        " WHERE backup_copies < ?"
+        " ORDER BY backup_copies, size DESC LIMIT ?",
+    "redundancy_total":
+        "SELECT COALESCE(SUM(content_count), 0) AS n FROM backup_histogram"
+        " WHERE backup_copies < ?",
+    "only_on_rows":
+        "SELECT path, size FROM instances"
+        " WHERE medium_id=? AND only_here=1"
+        " ORDER BY size DESC LIMIT ?",
+    "only_on_totals":
+        "SELECT only_here_count, only_here_bytes FROM media WHERE medium_id=?",
+    "newest_scan":
+        "SELECT MAX(last_scanned) AS newest FROM media",
+}
 
 
 # --------------------------------------------------------------------------
@@ -553,15 +605,13 @@ def cmd_add_medium(conn, args):
 
 def cmd_media(conn, args):
     rows = conn.execute(
-        "SELECT medium_id, kind, is_backup, location_hint, last_scanned,"
-        "       file_count, byte_count"
-        " FROM media ORDER BY medium_id").fetchall()
+        QUERIES["media"]).fetchall()
     if not rows:
         print("no media registered yet — use: holdings add-medium <id> --kind drive")
         return
     print(f"{'MEDIUM':22} {'KIND':12} {'BK':3} {'FILES':>8} {'SIZE':>10}"
           f" {'LAST SCAN':19}  LOCATION")
-    for mid, kind, bk, loc, ts, nfiles, nbytes in rows:
+    for mid, kind, bk, loc, ts, nfiles, nbytes, _only_n, _only_b in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "never"
         print(f"{mid:22} {kind:12} {'y' if bk else '-':3} {nfiles:>8}"
               f" {human_size(nbytes):>10} {when:19}  {loc or ''}")
@@ -743,12 +793,8 @@ def cmd_whereis(conn, args):
     if h is None:
         sys.exit(f"'{args.target}' not found (give a path on a scanned medium,"
                  f" a filename, or a sha256:... hash)")
-    rows = conn.execute(
-        "SELECT i.medium_id, m.kind, m.is_backup, i.path, i.seen_at,"
-        "       m.location_hint"
-        " FROM instances i JOIN media m ON m.medium_id=i.medium_id"
-        " WHERE i.hash=? ORDER BY m.is_backup DESC, i.medium_id", (h,)).fetchall()
-    size = conn.execute("SELECT size FROM content WHERE hash=?", (h,)).fetchone()
+    rows = conn.execute(QUERIES["placements"], (h,)).fetchall()
+    size = conn.execute(QUERIES["content_size"], (h,)).fetchone()
     copies = len({r[0] for r in rows})
     backups = len({r[0] for r in rows if r[2]})
     print(f"{h}  ({human_size(size[0]) if size else '?'})")
@@ -767,13 +813,11 @@ def resolve_hash(conn, target: str):
     if p.is_file():
         return sha256_file(p)
     # try exact relative path, then basename match
-    row = conn.execute("SELECT hash FROM instances WHERE path=? LIMIT 1",
+    row = conn.execute(QUERIES["resolve_by_path"],
                        (target.lstrip("/"),)).fetchone()
     if row:
         return row[0]
-    rows = conn.execute(
-        "SELECT DISTINCT hash FROM instances WHERE name=? LIMIT 2",
-        (target,)).fetchall()
+    rows = conn.execute(QUERIES["resolve_by_name"], (target,)).fetchall()
     if len(rows) == 1:
         return rows[0][0]
     if len(rows) > 1:
@@ -784,18 +828,14 @@ def resolve_hash(conn, target: str):
 
 def cmd_redundancy(conn, args):
     """Content with fewer than --min-copies copies on *backup* media."""
-    rows = conn.execute(
-        "SELECT hash, size, backup_copies, copies, example_path FROM content"
-        " WHERE backup_copies < ?"
-        " ORDER BY backup_copies, size DESC LIMIT ?",
-        (args.min_copies, args.limit)).fetchall()
+    rows = conn.execute(QUERIES["redundancy_rows"],
+                        (args.min_copies, args.limit)).fetchall()
     if not rows:
         print(f"OK: everything has at least {args.min_copies}"
               f" backup cop{'y' if args.min_copies==1 else 'ies'}.")
         return
-    total = conn.execute(
-        "SELECT COALESCE(SUM(content_count), 0) FROM backup_histogram"
-        " WHERE backup_copies < ?", (args.min_copies,)).fetchone()[0]
+    total = conn.execute(QUERIES["redundancy_total"],
+                         (args.min_copies,)).fetchone()[0]
     print(f"{total} content objects below {args.min_copies} backup copies"
           f" (showing up to {args.limit}, largest first):")
     print(f"{'BK':>2} {'ALL':>3} {'SIZE':>10}  EXAMPLE PATH")
@@ -827,14 +867,10 @@ def cmd_only_on(conn, args):
     # copies=1 means exactly one medium holds it; combined with an instance
     # on this medium, that medium is this one. Driven from content so the
     # cost is the size of the singleton set, not the size of the medium.
-    rows = conn.execute(
-        "SELECT path, size FROM instances"
-        " WHERE medium_id=? AND only_here=1"
-        " ORDER BY size DESC LIMIT ?",
-        (args.medium_id, args.limit)).fetchall()
+    rows = conn.execute(QUERIES["only_on_rows"],
+                        (args.medium_id, args.limit)).fetchall()
     total, tbytes = conn.execute(
-        "SELECT only_here_count, only_here_bytes FROM media WHERE medium_id=?",
-        (args.medium_id,)).fetchone() or (0, 0)
+        QUERIES["only_on_totals"], (args.medium_id,)).fetchone() or (0, 0)
     print(f"{total} files ({human_size(tbytes)}) exist ONLY on"
           f" '{args.medium_id}':")
     for path, size in rows:
@@ -842,11 +878,9 @@ def cmd_only_on(conn, args):
 
 
 def cmd_stats(conn, args):
-    row = conn.execute(
-        "SELECT content_count, content_bytes, instance_count"
-        " FROM catalog_summary WHERE id=1").fetchone()
+    row = conn.execute(QUERIES["summary"]).fetchone()
     n_content, t_bytes, n_inst = row or (0, 0, 0)
-    n_media = conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]
+    n_media = conn.execute(QUERIES["media_count"]).fetchone()[0]
     dup = n_inst - n_content if n_content else 0
     print(f"media: {n_media}   unique content: {n_content}"
           f" ({human_size(t_bytes)})   instances: {n_inst}"

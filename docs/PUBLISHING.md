@@ -102,6 +102,19 @@ If you ever publish something irreplaceable — the human OntoDAG
 categorisation, a vault — the invariant to hold is that Swarm is never the
 sole copy.
 
+## A page, not just a CLI
+
+`web/publish.py` publishes a read-only viewer — media, `whereis`,
+`redundancy`, `only-on` — that anyone can open in a browser with nothing
+installed. Pair it with a feed so the site is published once and only the
+catalog is republished after each scan:
+
+```bash
+python web/publish.py --feed <owner-hex>/holdings
+```
+
+See the README's *browser viewer* section for what it costs to read.
+
 ## What publishing does not give you
 
 - **Not a write path.** Published catalogs are read-only; `add-medium`,
