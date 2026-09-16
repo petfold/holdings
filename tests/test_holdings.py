@@ -1526,3 +1526,124 @@ def test_policy_json_carries_the_thresholds(two_drives_one_room, capsys):
     doc = json.loads(capsys.readouterr().out)
     assert doc["min_sites"] == 2
     assert doc["items"][0]["backup_sites"] == 1
+
+
+# ------------------------------------------- seen, versus actually verified
+
+def test_a_rescan_does_not_re_read_the_file(run, db, capsys, tmp_path):
+    """The distinction the columns exist for: `seen_at` means the filesystem
+    still listed it at this size. Only `verified_at` means someone read the
+    bytes — and bit rot changes neither size nor mtime."""
+    root = tmp_path / "drive"
+    write(root / "a.txt", "content")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    with sqlite3.connect(db) as c:
+        first, evidence = c.execute(
+            "SELECT verified_at, evidence FROM instances").fetchone()
+    assert evidence == "hashed" and first is not None
+
+    run("scan", "d", str(root))                    # unchanged: no read
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        seen, verified, evidence = c.execute(
+            "SELECT seen_at, verified_at, evidence FROM instances").fetchone()
+    assert evidence == "metadata"
+    assert verified == first, "verification date must not advance on a re-list"
+    assert seen > verified, "but the sighting is fresh"
+
+
+def test_a_full_scan_re_verifies(run, db, capsys, tmp_path):
+    root = tmp_path / "drive"
+    write(root / "a.txt", "content")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    with sqlite3.connect(db) as c:
+        first = c.execute("SELECT verified_at FROM instances").fetchone()[0]
+    run("scan", "d", str(root), "--full")
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        again, evidence = c.execute(
+            "SELECT verified_at, evidence FROM instances").fetchone()
+    assert again > first and evidence == "hashed"
+
+
+def test_content_changing_under_us_is_reported_not_swallowed(
+        run, db, capsys, tmp_path):
+    """On a medium nobody edits, a changed hash is what rot looks like. The
+    upsert used to replace the hash and say nothing."""
+    root = tmp_path / "drive"
+    f = write(root / "a.txt", "original")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    capsys.readouterr()
+
+    f.write_bytes(b"rotted!!")                     # same length, new bytes
+    run("scan", "d", str(root), "--full")
+    err = capsys.readouterr().err
+    assert "hashed to something other than the catalog recorded" in err
+    assert "was sha256:" in err and "now sha256:" in err
+
+
+def test_imported_listings_are_marked_as_the_weakest_evidence(
+        run, db, capsys, tmp_path):
+    listing = tmp_path / "ls.json"
+    listing.write_text(json.dumps(
+        {"struct_type": "node", "type": "file", "path": "/x.pdf", "size": 9}))
+    run("add-medium", "r", "--kind", "restic-repo",
+        "--durability", "independent")
+    run("import-restic", "r", str(listing))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT evidence, verified_at FROM instances"
+                         ).fetchone() == ("imported", None)
+
+
+def test_verified_within_discounts_stale_evidence(run, db, capsys, tmp_path):
+    """A copy nobody has read in years is weak evidence — and for the drive
+    in the safe in another country, that is the normal state."""
+    root = tmp_path / "drive"
+    write(root / "a.txt", "content")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    capsys.readouterr()
+    run("redundancy", "--min-copies", "1", "--verified-within", "30",
+        "--exit-code")                             # just read it: passes
+
+    with sqlite3.connect(db) as c:                 # two years pass
+        old = time.time() - 730 * 86400
+        c.execute("UPDATE instances SET verified_at=?", (old,))
+        c.execute("UPDATE content SET backup_verified_at=?", (old,))
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "1", "--verified-within", "30",
+            "--exit-code")
+    assert "read within 30d" in capsys.readouterr().out
+
+
+def test_never_verified_content_counts_as_unverified(run, db, capsys,
+                                                     tmp_path):
+    listing = tmp_path / "ls.json"
+    listing.write_text(json.dumps(
+        {"struct_type": "node", "type": "file", "path": "/x.pdf", "size": 9}))
+    run("add-medium", "r", "--kind", "restic-repo",
+        "--durability", "independent")
+    run("import-restic", "r", str(listing))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "1", "--verified-within", "365",
+            "--exit-code")
+    assert "never" in capsys.readouterr().out
+
+
+def test_media_reports_when_it_was_last_actually_read(run, db, capsys,
+                                                      tmp_path):
+    root = tmp_path / "drive"
+    write(root / "a.txt", "content")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    capsys.readouterr()
+    run("media")
+    out = capsys.readouterr().out
+    assert "LAST READ" in out
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT verified_at FROM media").fetchone()[0]

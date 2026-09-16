@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS content (
     backup_copies INTEGER NOT NULL DEFAULT 0,-- distinct *backup* media
     backup_sites  INTEGER NOT NULL DEFAULT 0,-- distinct sites among those
     backup_kinds  INTEGER NOT NULL DEFAULT 0,-- distinct kinds among those
+    -- The most recent time any backup copy of this content was actually
+    -- read. NULL means no backup copy has ever been confirmed by reading it.
+    backup_verified_at REAL,
     example_path  TEXT                       -- lowest path, for reports
 );
 
@@ -101,7 +104,14 @@ CREATE TABLE IF NOT EXISTS instances (
     hash      TEXT NOT NULL REFERENCES content(hash),
     size      INTEGER NOT NULL,
     mtime     REAL,                          -- NULL for imported (e.g. restic) listings
-    seen_at   REAL NOT NULL,
+    seen_at   REAL NOT NULL,             -- the filesystem still listed it
+    -- When the bytes were last actually read and hashed to the value above.
+    -- `seen_at` only ever meant "still listed at this size"; a rescan reuses
+    -- the stored hash without opening the file, and bit rot changes neither
+    -- size nor mtime. The distinction is the difference between believing a
+    -- backup exists and knowing it does.
+    verified_at REAL,
+    evidence    TEXT,                    -- hashed | metadata | imported
     -- Derived from path, stored because it is what gets searched for.
     -- Added by ALTER TABLE on older catalogs, so it must stay last here:
     -- fresh and migrated databases then agree on column order.
@@ -172,9 +182,13 @@ def migrate(conn: sqlite3.Connection) -> None:
     for table, column, decl in [
         ("instances", "name", "TEXT"),
         ("instances", "only_here", "INTEGER NOT NULL DEFAULT 0"),
+        ("instances", "verified_at", "REAL"),
+        ("instances", "evidence", "TEXT"),
         ("media", "durability", "TEXT NOT NULL DEFAULT 'working'"),
         ("media", "site", "TEXT"),
         ("content", "backup_sites", "INTEGER NOT NULL DEFAULT 0"),
+        ("content", "backup_verified_at", "REAL"),
+        ("media", "verified_at", "REAL"),
         ("content", "backup_kinds", "INTEGER NOT NULL DEFAULT 0"),
         ("media", "lease_expires", "REAL"),
         ("media", "lease_checked", "REAL"),
@@ -455,7 +469,7 @@ QUERIES = {
     "media":
         "SELECT medium_id, kind, is_backup, location_hint, last_scanned,"
         "       file_count, byte_count, only_here_count, only_here_bytes,"
-        "       durability, lease_expires, site"
+        "       durability, lease_expires, site, verified_at"
         " FROM media ORDER BY medium_id",
     "summary":
         "SELECT content_count, content_bytes, instance_count"
@@ -485,12 +499,14 @@ QUERIES = {
     # keeps its index and its page economy.
     "policy_rows":
         "SELECT hash, size, backup_copies, copies, example_path,"
-        "       backup_sites, backup_kinds FROM content"
+        "       backup_sites, backup_kinds, backup_verified_at FROM content"
         " WHERE backup_copies < ? OR backup_sites < ? OR backup_kinds < ?"
+        "    OR (? > 0 AND COALESCE(backup_verified_at, 0) < ?)"
         " ORDER BY backup_copies, size DESC LIMIT ?",
     "policy_total":
         "SELECT COUNT(*) AS n FROM content"
-        " WHERE backup_copies < ? OR backup_sites < ? OR backup_kinds < ?",
+        " WHERE backup_copies < ? OR backup_sites < ? OR backup_kinds < ?"
+        "    OR (? > 0 AND COALESCE(backup_verified_at, 0) < ?)",
     "only_on_rows":
         "SELECT path, size FROM instances"
         " WHERE medium_id=? AND only_here=1"
@@ -530,6 +546,8 @@ SELECT i.hash AS hash,
        COUNT(DISTINCT CASE WHEN m.is_backup
                            THEN COALESCE(m.site, '?') END) AS backup_sites,
        COUNT(DISTINCT CASE WHEN m.is_backup THEN m.kind END) AS backup_kinds,
+       MAX(CASE WHEN m.is_backup THEN i.verified_at END)
+           AS backup_verified_at,
        MIN(i.path) AS example_path
   FROM instances i JOIN media m ON m.medium_id = i.medium_id
  GROUP BY i.hash
@@ -538,7 +556,7 @@ SELECT i.hash AS hash,
 _RECOMPUTE = f"""
 SELECT c.hash, COALESCE(x.copies, 0), COALESCE(x.backup_copies, 0),
        COALESCE(x.backup_sites, 0), COALESCE(x.backup_kinds, 0),
-       x.example_path
+       x.backup_verified_at, x.example_path
   FROM content c LEFT JOIN ({_GROUPED}) x ON x.hash = c.hash
 """
 
@@ -607,6 +625,9 @@ def refresh_derived(conn) -> None:
         "    (SELECT backup_sites FROM _counts WHERE hash = content.hash), 0),"
         "  backup_kinds = COALESCE("
         "    (SELECT backup_kinds FROM _counts WHERE hash = content.hash), 0),"
+        "  backup_verified_at ="
+        "    (SELECT backup_verified_at FROM _counts"
+        "      WHERE hash = content.hash),"
         "  example_path ="
         "    (SELECT example_path FROM _counts WHERE hash = content.hash)")
     conn.execute("DROP TABLE temp._counts")
@@ -626,7 +647,9 @@ def refresh_derived(conn) -> None:
         "    WHERE i.medium_id = media.medium_id AND c.copies = 1),"
         "  only_here_bytes = COALESCE((SELECT SUM(c.size) FROM instances i"
         "     JOIN content c ON c.hash = i.hash"
-        "    WHERE i.medium_id = media.medium_id AND c.copies = 1), 0)")
+        "    WHERE i.medium_id = media.medium_id AND c.copies = 1), 0),"
+        "  verified_at = (SELECT MAX(verified_at) FROM instances"
+        "                  WHERE medium_id = media.medium_id)")
     conn.execute("DELETE FROM backup_histogram")
     conn.execute(
         "INSERT INTO backup_histogram (backup_copies, content_count)"
@@ -694,7 +717,7 @@ def derived_drift(conn) -> list[str]:
     expected = {h: row for h, *row in conn.execute(_RECOMPUTE)}
     stored = {h: row for h, *row in conn.execute(
         "SELECT hash, copies, backup_copies, backup_sites, backup_kinds,"
-        "       example_path FROM content")}
+        "       backup_verified_at, example_path FROM content")}
     off = [h for h in stored if stored[h] != expected.get(h)]
     if off:
         problems.append(
@@ -835,22 +858,25 @@ def cmd_media(conn, args):
     fields = ("medium_id", "kind", "is_backup", "location_hint",
               "last_scanned", "file_count", "byte_count",
               "only_here_count", "only_here_bytes",
-              "durability", "lease_expires", "site")
+              "durability", "lease_expires", "site", "verified_at")
     if emit_json(args, {"media": [dict(zip(fields, r)) for r in rows]}):
         return
     if not rows:
         print("no media registered yet — use: holdings add-medium <id> --kind drive")
         return
     print(f"{'MEDIUM':22} {'KIND':12} {'SURVIVES':12} {'SITE':10}"
-          f" {'FILES':>8} {'SIZE':>10} {'LAST SCAN':19}  LOCATION")
+          f" {'FILES':>8} {'SIZE':>10} {'LAST SCAN':19} {'LAST READ':10}"
+          f"  LOCATION")
     for (mid, kind, _bk, loc, ts, nfiles, nbytes, _only_n, _only_b,
-         durability, expires, site) in rows:
+         durability, expires, site, verified) in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "never"
         shown = durability
         if durability == "leased" and expires:
             shown = f"{durability}*" if expires <= time.time() else durability
+        read = (time.strftime("%Y-%m-%d", time.localtime(verified))
+                if verified else "never")
         print(f"{mid:22} {kind:12} {shown:12} {(site or '-'):10}"
-              f" {nfiles:>8} {human_size(nbytes):>10} {when:19}"
+              f" {nfiles:>8} {human_size(nbytes):>10} {when:19} {read:10}"
               f"  {loc or ''}")
 
 
@@ -879,6 +905,8 @@ def cmd_scan(conn, args):
     # drive that is failing and a drive you tidied up look identical to the
     # prune below, and only one of them means the copy is gone.
     unreadable: list[str] = []
+    # Paths that hashed to something other than what the catalog recorded.
+    changed: list[tuple[str, str, str]] = []
     for dirpath, dirnames, filenames in os.walk(scan_root):
         rel_dir = os.path.relpath(dirpath, mount)
         rel_dir = "" if rel_dir == "." else rel_dir
@@ -902,12 +930,15 @@ def cmd_scan(conn, args):
             bytes_seen += st.st_size
 
             row = conn.execute(
-                "SELECT hash, size, mtime FROM instances"
+                "SELECT hash, size, mtime, verified_at FROM instances"
                 " WHERE medium_id=? AND path=?",
                 (args.medium_id, rel_path)).fetchone()
+            verified = None
             if (row and not args.full and row[1] == st.st_size
                     and row[2] is not None and abs(row[2] - st.st_mtime) < 1e-6):
                 file_hash = row[0]          # unchanged: reuse known hash
+                evidence = "metadata"       # the filesystem said so, no read
+                verified = row[3]           # whatever an earlier read proved
             else:
                 try:
                     file_hash = sha256_file(full)
@@ -916,6 +947,13 @@ def cmd_scan(conn, args):
                     print(f"  ! cannot read {rel_path}: {e}", file=sys.stderr)
                     continue
                 hashed += 1
+                evidence = "hashed"
+                verified = time.time()
+                # A path whose content changed under us. Legitimate when you
+                # edited the file; on a backup medium nobody edits, it is how
+                # rot looks -- and it used to be swallowed by the upsert.
+                if row and row[0] != file_hash:
+                    changed.append((rel_path, row[0], file_hash))
 
             conn.execute(
                 "INSERT INTO content (hash, size, first_seen) VALUES (?,?,?)"
@@ -923,14 +961,17 @@ def cmd_scan(conn, args):
                 (file_hash, st.st_size, time.time()))
             conn.execute(
                 "INSERT INTO instances"
-                " (medium_id, path, name, hash, size, mtime, seen_at)"
-                " VALUES (?,?,?,?,?,?,?)"
+                " (medium_id, path, name, hash, size, mtime, seen_at,"
+                "  verified_at, evidence)"
+                " VALUES (?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(medium_id, path) DO UPDATE SET"
                 "   name=excluded.name, hash=excluded.hash,"
                 "   size=excluded.size,"
-                "   mtime=excluded.mtime, seen_at=excluded.seen_at",
+                "   mtime=excluded.mtime, seen_at=excluded.seen_at,"
+                "   verified_at=excluded.verified_at,"
+                "   evidence=excluded.evidence",
                 (args.medium_id, rel_path, basename(rel_path), file_hash,
-                 st.st_size, st.st_mtime, time.time()))
+                 st.st_size, st.st_mtime, time.time(), verified, evidence))
             if files_seen % 500 == 0:
                 conn.commit()
                 print(f"  … {files_seen} files ({human_size(bytes_seen)})",
@@ -964,6 +1005,12 @@ def cmd_scan(conn, args):
           f" ({human_size(bytes_seen)}), {hashed} hashed,"
           f" {pruned} vanished entries pruned,"
           f" {time.time()-started:.1f}s")
+    if changed:
+        print(f"WARNING: {len(changed)} file(s) on '{args.medium_id}' hashed"
+              f" to something other than the catalog recorded. On a medium"
+              f" nobody edits, that is what rot looks like:", file=sys.stderr)
+        for pth, was, now in changed[:10]:
+            print(f"  {pth}\n    was {was}\n    now {now}", file=sys.stderr)
     if unreadable:
         print(f"WARNING: {len(unreadable)} file(s) on '{args.medium_id}' could"
               f" not be read. Their catalog entries were kept, not pruned --"
@@ -1014,11 +1061,13 @@ def cmd_import_restic(conn, args):
                     " ON CONFLICT(hash) DO NOTHING", (h, size, time.time()))
             conn.execute(
                 "INSERT INTO instances"
-                " (medium_id, path, name, hash, size, mtime, seen_at)"
-                " VALUES (?,?,?,?,?,NULL,?)"
+                " (medium_id, path, name, hash, size, mtime, seen_at,"
+                "  evidence)"
+                " VALUES (?,?,?,?,?,NULL,?,'imported')"
                 " ON CONFLICT(medium_id, path) DO UPDATE SET"
                 "   name=excluded.name, hash=excluded.hash,"
-                "   size=excluded.size, seen_at=excluded.seen_at",
+                "   size=excluded.size, seen_at=excluded.seen_at,"
+                "   evidence=excluded.evidence",
                 (args.medium_id, path, basename(path), h, size, time.time()))
             count += 1
     conn.execute(
@@ -1099,15 +1148,18 @@ def cmd_redundancy(conn, args):
     # The default question -- "fewer than N backup copies" -- stays on the
     # index. Asking the full 3-2-1 question costs a scan, so it happens only
     # when the extra thresholds are actually set.
-    full = args.min_sites > 1 or args.min_kinds > 1
+    full = (args.min_sites > 1 or args.min_kinds > 1
+            or args.verified_within > 0)
     if full:
-        rows = conn.execute(
-            QUERIES["policy_rows"],
-            (args.min_copies, args.min_sites, args.min_kinds,
-             args.limit)).fetchall()
-        total = conn.execute(
-            QUERIES["policy_total"],
-            (args.min_copies, args.min_sites, args.min_kinds)).fetchone()[0]
+        # 0 disables the clause entirely; otherwise anything whose newest
+        # backup verification is older than the cutoff (or absent) counts.
+        cutoff = (time.time() - args.verified_within * 86400
+                  if args.verified_within > 0 else 0)
+        params = (args.min_copies, args.min_sites, args.min_kinds,
+                  args.verified_within, cutoff)
+        rows = conn.execute(QUERIES["policy_rows"],
+                            params + (args.limit,)).fetchall()
+        total = conn.execute(QUERIES["policy_total"], params).fetchone()[0]
     else:
         rows = conn.execute(QUERIES["redundancy_rows"],
                             (args.min_copies, args.limit)).fetchall()
@@ -1120,7 +1172,7 @@ def cmd_redundancy(conn, args):
     risks = lease_risks(conn, args.lease_margin)
 
     cols = ("hash", "size", "backup_copies", "copies", "example_path",
-            "backup_sites", "backup_kinds")
+            "backup_sites", "backup_kinds", "backup_verified_at")
     if emit_json(args, {
             "min_copies": args.min_copies,
             "min_sites": args.min_sites,
@@ -1140,17 +1192,25 @@ def cmd_redundancy(conn, args):
     if full:
         policy += (f", {plural(args.min_sites, 'site')}"
                    f", {plural(args.min_kinds, 'kind')}")
+        if args.verified_within > 0:
+            policy += f", read within {args.verified_within:.0f}d"
     if not rows:
         print(f"OK: everything meets {policy}.")
         policy_exit(args, total + len(risks))
         return
     print(f"{total} content objects below {policy}"
           f" (showing up to {args.limit}, largest first):")
-    head = f"{'BK':>2} {'ALL':>3}" + (f" {'SITE':>4} {'KIND':>4}" if full else "")
+    head = f"{'BK':>2} {'ALL':>3}"
+    if full:
+        head += f" {'SITE':>4} {'KIND':>4} {'READ':>10}"
     print(f"{head} {'SIZE':>10}  EXAMPLE PATH")
     for row in rows:
         h, size, bcopies, copies, path = row[:5]
-        extra = f" {row[5]:>4} {row[6]:>4}" if full else ""
+        extra = ""
+        if full:
+            when = (time.strftime("%Y-%m-%d", time.localtime(row[7]))
+                    if row[7] else "never")
+            extra = f" {row[5]:>4} {row[6]:>4} {when:>10}"
         print(f"{bcopies:>2} {copies:>3}{extra}"
               f" {human_size(size):>10}  {path}")
     policy_exit(args, total + len(risks))
@@ -1339,6 +1399,12 @@ def build_parser():
     s.add_argument("--min-kinds", type=int, default=1, metavar="N",
                    help="the '2 media' of 3-2-1: require backup copies on N"
                         " distinct kinds of medium (default 1, unchecked)")
+    s.add_argument("--verified-within", type=float, default=0.0,
+                   metavar="DAYS",
+                   help="require that some backup copy was actually read"
+                        " within this many days -- a rescan reuses the stored"
+                        " hash without opening the file, so 'seen' is not"
+                        " 'verified' (default 0, unchecked)")
     s.add_argument("--limit", type=int, default=40)
     s.add_argument("--lease-margin", type=float, metavar="DAYS",
                    default=DEFAULT_LEASE_MARGIN_DAYS,
