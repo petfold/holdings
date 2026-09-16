@@ -166,61 +166,40 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
       `--encrypt` is not optional for a file carrying filenames and location
       hints, feeds versus pins, postage renewal as a cron line, and what a
       lapsed batch does and does not cost.
-- [ ] **What does a copy survive?** — the modelling problem underneath
-      several requested features, filed once rather than per backend.
+- [x] **What does a copy survive?** (DONE 2026-09-16) — `media.durability`
+      replaces the asserted `is_backup` boolean, which is now derived from
+      it. Classes: `working`, `independent`, `mirror`, `leased`, `hosted`.
+      Only the last three count toward `redundancy`; a sync mirror does
+      not, because your deletion reaches it.
 
-      `is_backup` is a single boolean standing in for a question with
-      several different answers. Each kind of copy fails its own way:
+      Urgent once `--exit-code` shipped: that turned `redundancy` into a
+      gate scripts trust, and the gate was only as good as an unverified
+      boolean covering five different failure modes. A file on a laptop and
+      in Dropbox now reads as two copies and no backups.
 
-      | fails by | meaning | examples |
-      |---|---|---|
-      | event | it breaks, is lost or stolen | drive, laptop |
-      | inaction | it lapses on a schedule unless renewed | Swarm postage |
-      | propagation | your deletion reaches it | Syncthing, Dropbox, Drive |
-      | scope | it only ever held part of the tree | any git remote |
-      | participation | it exists while someone volunteers to host it | Radicle seeds |
-      | custodian | one party can remove it unilaterally | GitHub, Hugging Face |
-      | access | present, but hours from readable | Glacier, cold tiers |
+      Leases carry an expiry **and** the time the estimate was taken, and
+      are evaluated at read time rather than materialised — a lease lapses
+      with no write happening anywhere, so a stored answer would go quietly
+      wrong between scans. `--lease-margin` (default 14 days) sets the
+      headroom, since a node's TTL is an optimistic bound at the current
+      storage price. An aged estimate is reported rather than trusted.
+      Migration reads an existing `is_backup=1` as `independent`, which is
+      what it claimed.
 
-      Today `--backup` asserts "event" and nothing else, and the README now
-      says so. The fix is a small vocabulary of durability classes with
-      `is_backup` derived from it, so `redundancy` can answer "two copies,
-      one of which evaporates in three weeks" and `only-on` can stop
-      counting a sync mirror as somewhere else.
+      Still open, and each now has somewhere to live:
 
-      Cases, in the order they are worth doing:
-
-      * **Leased copies (Swarm).** Store the expiry estimate **and** when it
-        was taken. A node's TTL comes from the batch balance at the
-        *current* storage price; if the price rises the batch drains faster
-        than quoted, so it is an optimistic bound that also goes stale where
-        it sits — "18 days left", recorded four months ago, is an expired
-        lease. Read it conservatively, and never count a lease that is about
-        to lapse. The `sha256 → swarm reference` mapping is a by-product of
-        publishing, so placement is exact, unlike `import-restic`'s
-        basename+size matching.
-      * **Sync mirrors.** Scannable as a path today, which is exactly the
-        risk: nothing stops `--backup`. Wants a class that `redundancy`
-        discounts and `only-on` does not treat as elsewhere.
-      * **A generic listing importer.** restic, S3/B2, rclone and Swarm are
-        one shape — a listing of paths and sizes — not four readers.
-        Hashes are approximate unless you controlled the upload, in which
-        case they are exact.
-      * **Hubs (GitHub, Hugging Face, Radicle).** Needs git-awareness, not
-        a directory scan: only content that is committed *and* pushed *and*
-        still reachable from a remote ref is there, which excludes precisely
-        the files someone is working on. Doing it as a scan would
-        systematically overstate redundancy. `.git` is in the default
-        excludes, so holdings currently sees working trees and no history.
-
-        Radicle differs from the others in a way worth modelling rather than
-        flattening: no custodian who can close your account, but
-        availability is the sum of voluntary seeds, so the countable thing
-        is **seeds other than your own**. A repo seeded only by your own
-        node is not a second copy. That is the same uptime-dependence that
-        makes peer-to-peer sync need overlapping availability — the problem
-        publishing to Swarm was adopted to avoid — so the two should not be
-        given the same class.
+      * **Swarm as a medium** — `sha256 → swarm reference` mapping as a
+        by-product of publishing, so placement is exact. The lease
+        machinery it needed now exists.
+      * **A generic listing importer** — restic, S3/B2, rclone and Swarm
+        are one shape (a listing of paths and sizes), not four readers.
+      * **Hubs** — needs git-awareness, not a directory scan: only content
+        committed *and* pushed *and* still reachable from a remote ref is
+        there. `hosted` is the class; the reader is the work. Radicle sits
+        in the same class but its countable quantity is seeds *other than
+        your own* — a repo seeded only by your node is not a second copy.
+      * **Sync mirrors as a placement source** — v0.2's Syncthing REST
+        adapter feeds `mirror`, and the class is now there to receive it.
 
 ## Future — the browser
 

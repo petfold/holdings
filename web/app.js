@@ -40,6 +40,20 @@ function humanSize(n) {
 const day = (ts) =>
   ts ? new Date(ts * 1000).toISOString().slice(0, 10) : 'never';
 
+// What a medium's copies survive. Green where the copy outlives deletion of
+// the original; plain where it does not (a sync mirror is not a backup);
+// red where a lease has lapsed, which is a backup you stopped paying for.
+function durabilityTag(r) {
+  if (r.durability === 'leased' && r.lease_expires) {
+    const days = (r.lease_expires * 1000 - Date.now()) / 86400000;
+    if (days <= 0) return '<span class="tag danger">lease lapsed</span>';
+    const cls = days < 14 ? 'tag danger' : 'tag backup';
+    return `<span class="${cls}">leased · ${days.toFixed(0)}d</span>`;
+  }
+  const backs = ['independent', 'leased', 'hosted'].includes(r.durability);
+  return `<span class="tag${backs ? ' backup' : ''}">${esc(r.durability)}</span>`;
+}
+
 function economy(label, t0) {
   const s = db.stats();
   const pages = s.pagesFetched - (seen?.pagesFetched ?? 0);
@@ -87,8 +101,7 @@ async function showMedia() {
      { label: 'Size', num: true }, { label: 'Only here', num: true },
      { label: 'Last scan' }, { label: 'Location' }],
     rows.map((r) => [
-      { html: `${esc(r.medium_id)} ${r.is_backup
-          ? '<span class="tag backup">backup</span>' : ''}` },
+      { html: `${esc(r.medium_id)} ${durabilityTag(r)}` },
       { html: esc(r.kind) },
       { html: r.file_count.toLocaleString() },
       { html: humanSize(r.byte_count) },

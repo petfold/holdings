@@ -85,38 +85,51 @@ drive with confidence.
 
 ## What counts as a backup copy
 
-`--backup` is what `redundancy` and `only-on` count, and `only-on` is a list
-people wipe drives from — so it is worth being strict about. **holdings
-cannot verify the claim.** It takes `--backup` at face value when you
-register a medium, which makes it your assertion, not a measurement.
+`--backup` used to be a claim you made, and `redundancy` believed it. Since
+that report is now a gate scripts run (`--exit-code`, above), the question
+lives in the data instead. Every medium has a **durability class**, and the
+test each answers is: *if the original is deleted, does this copy survive,
+and for how long?*
 
-The test is not "the file is in two places". It is: *if the original is
-deleted, does the copy survive?*
-
-| medium | survives | does not survive |
+| class | survives deletion? | examples |
 |---|---|---|
-| second drive, offsite or offline | deletion, ransomware, device loss | its own failure |
-| restic repo, versioned object storage | deletion of the original | the repo being lost or pruned |
-| **Syncthing / Dropbox / Drive mirror** | losing a device | **deletion — it propagates** |
-| git remote (GitHub, Hugging Face, Radicle) | losing the working tree | anything uncommitted, unpushed or ignored |
-| Swarm pin | losing every device you own | **the postage batch lapsing** |
+| `working` | no — it *is* the original | the laptop you edit on |
+| `independent` | yes, until it fails itself | second drive, restic repo |
+| `mirror` | **no — your deletion propagates** | Syncthing, Dropbox, Drive |
+| `leased` | yes, until the lease lapses | Swarm postage, prepaid storage |
+| `hosted` | yes, while someone else allows it | GitHub, Hugging Face, Radicle |
 
-The one that catches people is the sync mirror. A Syncthing or Dropbox
-folder is just a path, so `holdings scan cloud-dropbox ~/Dropbox` works
-today — but marking it `--backup` makes `redundancy` report two copies of a
-file that a single `rm` removes from both. It protects against device loss
-and nothing else.
+```bash
+./holdings.py add-medium drive-budapest --kind drive --durability independent
+./holdings.py add-medium dropbox        --kind cloud --durability mirror
+./holdings.py add-medium swarm          --kind cloud --durability leased \
+                                        --lease-expires 30d
+```
 
-Hubs have a different catch: only content that is **committed *and* pushed**
-is really there, which is never the files you are actively editing. And each
-hub fails its own way — a single custodian who can close your account
-(GitHub, Hugging Face), or, for peer-to-peer hosting like Radicle,
-availability that is the sum of whoever volunteers to seed you. A Radicle
-repo seeded only by your own node is not a second copy; it is the same
-copy.
+`--backup` still works and means `--durability independent`.
 
-None of this is modelled yet — `--backup` is one boolean standing in for all
-of it. See [ROADMAP.md](ROADMAP.md) for the shape of the fix.
+Only `independent`, `leased` and `hosted` count toward `redundancy`. A sync
+mirror does not: it protects against losing a device and nothing else, so a
+file on your laptop and in Dropbox has **two copies and no backups** — which
+is what `redundancy` now says, and what one `rm` would have proved.
+
+A lease counts while it holds, and is checked at read time rather than
+stored, because a lease lapses with no write happening anywhere:
+
+```
+$ holdings redundancy --min-copies 2
+AT RISK: leased medium 'swarm' -- 9 days left
+```
+
+`--lease-margin DAYS` (default 14) sets how much headroom a lease needs. The
+margin matters because a node's TTL is an estimate at the *current* storage
+price: if the price rises the batch drains faster than quoted, so the figure
+is an optimistic bound. holdings stores the estimate *and* when it was
+taken, and says so when an estimate has aged.
+
+holdings still cannot verify any of this — the class is your assertion when
+you register a medium. What it can do is stop one word standing in for five
+different things.
 
 ## Reading a published catalog (optional)
 
@@ -247,7 +260,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **103 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **116 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.
