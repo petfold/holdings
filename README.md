@@ -213,7 +213,33 @@ hash. The hash stays the identity; the reference is an address on one
 medium, and storing it is what makes a remote copy checkable later without
 downloading it again.
 
-The honesty is the same as `import-restic`: a listing proves paths and
+Which makes it the first remote medium that can be **checked** rather
+than trusted:
+
+```bash
+./holdings.py check-swarm swarm --exit-code
+# checked 24 reference(s) on 'swarm' (the head of each file):
+#   24 retrievable, 0 not
+```
+
+An offsite drive has to be fetched and read. This asks the network instead,
+and costs no data transfer worth the name. Measured against a live node:
+24 references in **0.64s total**.
+
+The default probes the head of each file — one ranged byte, which resolves
+the reference and fetches the root chunk at the same cost whatever the file's
+size (12 ms measured). `--deep` uses Bee's stewardship endpoint, which walks
+every chunk: 1.0s for a 109-byte file, and no answer within 30s for a 138 MB
+one. Thorough, and priced accordingly.
+
+It confirms a copy is still *reachable at that address* — not that its bytes
+hash to what the catalog recorded. So it updates the sighting and never the
+verification date. A reference that does not answer is reported and **never
+deleted**: a node that searched and found nothing is good evidence, not
+proof, and quietly lowering a copy count is the direction this tool must not
+err in.
+
+The honesty about placement is the same as `import-restic`: a listing proves paths and
 sizes, not bytes. Entries are matched to content already known by hash where
 that is unambiguous, and recorded as `unverified:` where it is not. For
 exact hashes, mount the root and `scan` it — reading the bytes is the only
@@ -370,7 +396,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **160 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **168 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

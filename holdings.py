@@ -1170,6 +1170,102 @@ def swarm_listing(root: str, api_url: str | None):
                "reference": info.get("reference")}
 
 
+DEFAULT_BEE_API = os.environ.get("BEE_API_URL", "http://localhost:1633")
+
+
+def swarm_probe(api_url: str, ref: str, deep: bool, timeout: float) -> bool:
+    """Is this Swarm reference still retrievable?
+
+    Two questions, and the difference is large enough to be the flag:
+
+    * the default asks for **one byte** -- a ranged read of the head. It
+      resolves the reference and fetches the root chunk, and it costs the
+      same whatever the file's size. Measured against a live node: 12 ms.
+    * `--deep` asks Bee's stewardship endpoint, which walks every chunk.
+      Measured: 1.0 s for a 109-byte file, and no answer at all within 30 s
+      for a 138 MB one. Thorough, and priced accordingly.
+
+    Neither proves content: the medium confirms a copy is still reachable
+    at that address, not that it hashes to what the catalog recorded. That
+    is why this updates `seen_at` and never `verified_at`.
+
+    Uses urllib, so this needs no optional extra -- just a reachable node.
+    """
+    import urllib.error
+    import urllib.request
+
+    api = api_url.rstrip("/")
+    if deep:
+        req = urllib.request.Request(f"{api}/stewardship/{ref}")
+    else:
+        req = urllib.request.Request(f"{api}/bytes/{ref}",
+                                     headers={"Range": "bytes=0-0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if deep:
+                return bool(json.loads(r.read() or b"{}").get("isRetrievable"))
+            return r.status in (200, 206)
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def cmd_check_swarm(conn, args):
+    """Ask the network whether a medium's copies are still there.
+
+    The first remote medium that can be checked rather than trusted. It
+    costs no data transfer worth the name, which is the whole point: an
+    offsite drive has to be fetched and read, and this does not.
+
+    A reference that does not answer is *reported*, never deleted. A 404
+    from a node that searched for five seconds is good evidence and not
+    proof, and the lesson from unreadable files on a failing drive applies
+    exactly: quietly lowering the copy count on content that may still be
+    there is the one direction this tool must not err in.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    rows = conn.execute(
+        "SELECT path, external_ref FROM instances"
+        " WHERE medium_id=? AND external_ref IS NOT NULL ORDER BY path"
+        + (" LIMIT ?" if args.limit else ""),
+        (args.medium_id, args.limit) if args.limit else (args.medium_id,)
+    ).fetchall()
+    if not rows:
+        sys.exit(f"'{args.medium_id}' has no instances carrying a reference"
+                 f" -- import-swarm records them")
+
+    api = args.api_url or DEFAULT_BEE_API
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        found = list(pool.map(
+            lambda r: swarm_probe(api, r[1], args.deep, args.timeout), rows))
+
+    ok = [p for (p, _), good in zip(rows, found) if good]
+    missing = [p for (p, _), good in zip(rows, found) if not good]
+    now = time.time()
+    conn.executemany(
+        "UPDATE instances SET seen_at=?, evidence='retrievable'"
+        " WHERE medium_id=? AND path=?",
+        [(now, args.medium_id, p) for p in ok])
+    refresh_derived(conn)
+    conn.commit()
+
+    if emit_json(args, {"medium_id": args.medium_id, "deep": args.deep,
+                        "checked": len(rows), "retrievable": len(ok),
+                        "missing": missing}):
+        policy_exit(args, len(missing))
+        return
+    depth = "every chunk" if args.deep else "the head of each file"
+    print(f"checked {len(rows)} reference(s) on '{args.medium_id}'"
+          f" ({depth}): {len(ok)} retrievable, {len(missing)} not")
+    for pth in missing[:20]:
+        print(f"  MISSING  {pth}", file=sys.stderr)
+    if missing:
+        print(f"Not deleted from the catalog: a node that searched and found"
+              f" nothing is good evidence, not proof. Re-check, and if it"
+              f" holds, the copy is gone.", file=sys.stderr)
+    policy_exit(args, len(missing))
+
+
 def cmd_import_swarm(conn, args):
     """Record what a published Swarm root holds, as a medium.
 
@@ -1614,6 +1710,23 @@ def build_parser():
                         " (needs holdings[swarm])")
     s.add_argument("--api-url")
     s.set_defaults(func=cmd_import_swarm, writes=True)
+
+    s = sub.add_parser("check-swarm",
+                       help="ask the network if a medium's copies are there")
+    s.add_argument("medium_id")
+    s.add_argument("--deep", action="store_true",
+                   help="walk every chunk (Bee stewardship) instead of"
+                        " probing the head of each file -- thorough, and"
+                        " costs time proportional to size")
+    s.add_argument("--workers", type=int, default=8)
+    s.add_argument("--timeout", type=float, default=30.0, metavar="SECONDS")
+    s.add_argument("--limit", type=int, default=0,
+                   help="check at most this many (0 = all)")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--exit-code", action="store_true",
+                   help="exit 1 when anything is not retrievable")
+    s.add_argument("--api-url")
+    s.set_defaults(func=cmd_check_swarm, writes=True)
 
     s = sub.add_parser("import-restic",
                        help="ingest `restic ls --json` output ('-' = stdin)")

@@ -618,7 +618,8 @@ def test_the_commands_that_write_are_the_ones_that_change_placement():
     [subs] = [a for a in holdings.build_parser()._actions
               if isinstance(a, argparse._SubParsersAction)]
     writers = {n for n, sp in subs.choices.items() if sp.get_default("writes")}
-    assert writers == {"add-medium", "scan", "import-restic", "import-swarm"}
+    assert writers == {"add-medium", "scan", "import-restic", "import-swarm",
+                       "check-swarm"}
 
 
 @pytest.mark.parametrize("argv", [
@@ -1932,3 +1933,117 @@ def no_swarmlite_import(monkeypatch, name):
         return real(mod, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", fake)
+
+
+# ------------------------------- checking a remote copy without fetching it
+
+@pytest.fixture
+def swarm_with_refs(run, tmp_path, capsys):
+    run("add-medium", "swarm", "--kind", "cloud", "--durability", "leased",
+        "--lease-expires", "300d")
+    listing = tmp_path / "l.jsonl"
+    listing.write_text("\n".join(json.dumps(e) for e in [
+        {"path": "a.txt", "size": 1, "reference": "ref-a"},
+        {"path": "b.txt", "size": 2, "reference": "ref-b"},
+        {"path": "c.txt", "size": 3, "reference": "ref-c"},
+    ]) + "\n")
+    run("import-swarm", "swarm", str(listing))
+    capsys.readouterr()
+    return run
+
+
+def fake_probe(monkeypatch, missing=()):
+    """Stand in for the network, so the suite stays offline."""
+    seen = []
+
+    def probe(api_url, ref, deep, timeout):
+        seen.append((ref, deep))
+        return ref not in missing
+
+    monkeypatch.setattr(holdings, "swarm_probe", probe)
+    return seen
+
+
+def test_all_copies_retrievable_is_a_clean_pass(swarm_with_refs, monkeypatch,
+                                                capsys):
+    fake_probe(monkeypatch)
+    swarm_with_refs("check-swarm", "swarm", "--exit-code")     # no raise
+    assert "3 retrievable, 0 not" in capsys.readouterr().out
+
+
+def test_a_missing_copy_is_reported_and_fails_the_policy(
+        swarm_with_refs, monkeypatch, capsys):
+    fake_probe(monkeypatch, missing={"ref-b"})
+    with pytest.raises(SystemExit) as e:
+        swarm_with_refs("check-swarm", "swarm", "--exit-code")
+    assert e.value.code == 1
+    assert "MISSING  b.txt" in capsys.readouterr().err
+
+
+def test_a_missing_copy_is_never_deleted_from_the_catalog(
+        swarm_with_refs, db, monkeypatch, capsys):
+    """Same lesson as an unreadable file on a failing drive: a node that
+    searched and found nothing is good evidence, not proof, and quietly
+    lowering the copy count is the direction this tool must not err in."""
+    fake_probe(monkeypatch, missing={"ref-b"})
+    with pytest.raises(SystemExit):
+        swarm_with_refs("check-swarm", "swarm", "--exit-code")
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert {p for p, in c.execute("SELECT path FROM instances")} \
+            == {"a.txt", "b.txt", "c.txt"}
+
+
+def test_retrievability_updates_sighting_but_never_verification(
+        swarm_with_refs, db, monkeypatch, capsys):
+    """The network confirms a copy is reachable at that address. It does not
+    confirm the bytes hash to what the catalog recorded — only reading them
+    does that."""
+    fake_probe(monkeypatch)
+    swarm_with_refs("check-swarm", "swarm")
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        for evidence, verified in c.execute(
+                "SELECT evidence, verified_at FROM instances"):
+            assert evidence == "retrievable"
+            assert verified is None, "a probe must not claim verification"
+
+
+def test_deep_is_opt_in(swarm_with_refs, monkeypatch, capsys):
+    """The default probe is constant-time; stewardship walks every chunk and
+    timed out entirely on a 138 MB file in live measurement."""
+    seen = fake_probe(monkeypatch)
+    swarm_with_refs("check-swarm", "swarm")
+    assert all(deep is False for _, deep in seen)
+    capsys.readouterr()
+    seen.clear()
+    swarm_with_refs("check-swarm", "swarm", "--deep")
+    assert all(deep is True for _, deep in seen)
+
+
+def test_check_swarm_json_lists_what_is_missing(swarm_with_refs, monkeypatch,
+                                                capsys):
+    fake_probe(monkeypatch, missing={"ref-a", "ref-c"})
+    with pytest.raises(SystemExit):
+        swarm_with_refs("check-swarm", "swarm", "--json", "--exit-code")
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["retrievable"] == 1
+    assert sorted(doc["missing"]) == ["a.txt", "c.txt"]
+
+
+def test_a_medium_without_references_says_so(run, tmp_path, capsys):
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    write(tmp_path / "disk" / "a.txt", "a")
+    run("scan", "d", str(tmp_path / "disk"))
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        run("check-swarm", "d")
+    assert "no instances carrying a reference" in str(e.value)
+
+
+def test_the_probe_needs_no_optional_extra(monkeypatch):
+    """urllib, not swarmlite: a reachable node is the only requirement."""
+    no_swarmlite_import(monkeypatch, "swarmlite")
+    no_swarmlite_import(monkeypatch, "fsspec")
+    assert holdings.swarm_probe("http://127.0.0.1:1", "ref", False, 0.2) \
+        is False        # unreachable, but it got as far as trying

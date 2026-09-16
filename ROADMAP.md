@@ -215,10 +215,25 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
         reference recorded, and `due` then ranked it first because nothing
         had ever read it.
 
-      * [ ] **Check a Swarm copy without downloading it** — the reference is
-        stored now, and Bee can be asked whether content is still
-        retrievable. That would make a leased copy the first remote medium
-        that can actually be verified rather than merely trusted.
+      * [x] **Check a Swarm copy without downloading it** (DONE
+        2026-09-16): `check-swarm`. The first remote medium that can be
+        checked rather than trusted — an offsite drive has to be fetched and
+        read; this asks the network. Measured live: 24 references in 0.64s.
+
+        The default probes the head of each file with a one-byte ranged
+        read: it resolves the reference and fetches the root chunk at the
+        same cost whatever the size (12 ms). `--deep` uses Bee's stewardship
+        endpoint, which walks every chunk — measured at 1.0s for a 109-byte
+        file and no answer within 30s for a 138 MB one, which is why it is
+        the flag and not the default.
+
+        It confirms reachability at an address, not content, so it updates
+        `seen_at` and never `verified_at`, and records `evidence`
+        `retrievable` — between `imported` and `hashed` on the ladder. A
+        reference that does not answer is reported and never deleted, for
+        the same reason an unreadable file on a failing drive is not.
+
+        Needs no optional extra: urllib and a reachable node.
 
       * **A generic listing importer** — restic, S3/B2, rclone and Swarm
         are one shape (a listing of paths and sizes), not four readers.
