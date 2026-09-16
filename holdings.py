@@ -840,6 +840,10 @@ def cmd_scan(conn, args):
     scan_id = cur.lastrowid
 
     files_seen = bytes_seen = hashed = 0
+    # Paths this scan could not read. Kept apart from "not seen", because a
+    # drive that is failing and a drive you tidied up look identical to the
+    # prune below, and only one of them means the copy is gone.
+    unreadable: list[str] = []
     for dirpath, dirnames, filenames in os.walk(scan_root):
         rel_dir = os.path.relpath(dirpath, mount)
         rel_dir = "" if rel_dir == "." else rel_dir
@@ -853,7 +857,9 @@ def cmd_scan(conn, args):
             full = Path(dirpath) / name
             try:
                 st = full.stat()
-            except OSError:
+            except OSError as e:
+                unreadable.append(rel_path)
+                print(f"  ! cannot stat {rel_path}: {e}", file=sys.stderr)
                 continue
             if not full.is_file() or full.is_symlink():
                 continue
@@ -871,6 +877,7 @@ def cmd_scan(conn, args):
                 try:
                     file_hash = sha256_file(full)
                 except OSError as e:
+                    unreadable.append(rel_path)
                     print(f"  ! cannot read {rel_path}: {e}", file=sys.stderr)
                     continue
                 hashed += 1
@@ -894,6 +901,15 @@ def cmd_scan(conn, args):
                 print(f"  … {files_seen} files ({human_size(bytes_seen)})",
                       file=sys.stderr)
 
+    # Spare what we merely failed to read. Without this, an I/O error means
+    # the row is not re-stamped, the prune below deletes it, and a failing
+    # drive is recorded as one whose files were deliberately removed --
+    # quietly lowering the copy count on content that is still there.
+    if unreadable:
+        conn.executemany(
+            "UPDATE instances SET seen_at=? WHERE medium_id=? AND path=?",
+            [(time.time(), args.medium_id, pth) for pth in unreadable])
+
     # prune instances under the scanned root that were not seen this scan
     prefix = (root_rel + "/") if root_rel else ""
     pruned = conn.execute(
@@ -913,6 +929,12 @@ def cmd_scan(conn, args):
           f" ({human_size(bytes_seen)}), {hashed} hashed,"
           f" {pruned} vanished entries pruned,"
           f" {time.time()-started:.1f}s")
+    if unreadable:
+        print(f"WARNING: {len(unreadable)} file(s) on '{args.medium_id}' could"
+              f" not be read. Their catalog entries were kept, not pruned --"
+              f" but this medium could not confirm them, and unreadable files"
+              f" on a backup medium are how a drive announces it is failing.",
+              file=sys.stderr)
 
 
 def cmd_import_restic(conn, args):

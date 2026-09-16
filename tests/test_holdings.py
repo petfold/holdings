@@ -1376,3 +1376,48 @@ def test_an_old_catalog_keeps_what_it_claimed(tmp_path, capsys):
         assert holdings.derived_drift(conn) == []
     finally:
         conn.close()
+
+
+# ------------------------------------------------- unreadable, not deleted
+
+def test_an_unreadable_file_is_not_pruned_as_deleted(run, db, capsys,
+                                                     tmp_path):
+    """A failing drive and a tidied-up one look identical to the prune.
+
+    Only one of them means the copy is gone, and getting it wrong lowers
+    the recorded copy count on content that is still there — the exact
+    direction this tool must never err in.
+    """
+    root = tmp_path / "drive"
+    write(root / "readable.txt", "fine")
+    bad = write(root / "rotten.txt", "was fine")
+    run("add-medium", "d", "--kind", "drive", "--durability", "independent")
+    run("scan", "d", str(root))
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT COUNT(*) FROM instances").fetchone()[0] == 2
+
+    bad.chmod(0o000)                       # now unreadable, still present
+    try:
+        run("scan", "d", str(root), "--full")
+        err = capsys.readouterr().err
+        with sqlite3.connect(db) as c:
+            paths = {p for p, in c.execute("SELECT path FROM instances")}
+        assert paths == {"readable.txt", "rotten.txt"}, "the entry was pruned"
+        assert "could not be read" in err
+    finally:
+        bad.chmod(0o644)
+
+
+def test_a_genuinely_removed_file_is_still_pruned(run, db, capsys, tmp_path):
+    """The fix must not make the catalog stop noticing real deletions."""
+    root = tmp_path / "drive"
+    write(root / "keep.txt", "keep")
+    gone = write(root / "gone.txt", "gone")
+    run("add-medium", "d", "--kind", "drive")
+    run("scan", "d", str(root))
+    gone.unlink()
+    run("scan", "d", str(root))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert {p for p, in c.execute("SELECT path FROM instances")} \
+            == {"keep.txt"}
