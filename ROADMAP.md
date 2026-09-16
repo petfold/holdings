@@ -235,10 +235,22 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
       now, and it may deserve stating once: the catalog treats a fact from
       five years ago exactly like one from yesterday unless something says
       otherwise.
-- [ ] **A verification schedule.** `--verified-within` asks the question but
-      nothing plans the answer: which medium is most overdue, and what would
-      it cost to re-read it. Wants `holdings verify --due` more than it
-      wants another column.
+- [x] **A verification schedule** (DONE 2026-09-16): `holdings due`.
+      `--verified-within` asked which content rests on stale evidence but
+      said nothing about what to do, and the answer is per-medium — you dig
+      one drive out of the safe and read it.
+
+      `media.sole_backup_count` / `sole_backup_bytes` is the new number:
+      content whose *only* backup copy is on that medium, which is what
+      re-reading it would protect. Distinct from `only_here_*`, where a
+      working copy may exist but nothing would survive deleting it.
+
+      Ordering is explainable rather than weighted — sole backups first,
+      then longest unread — because the output is a plan someone acts on.
+      Read-only, and everything it needs is already on the media row, so it
+      is a handful of pages even against a published catalog: "what should
+      I dig out of the safe next?" is a question worth being able to ask
+      from a phone.
 
 ## Future — the browser
 

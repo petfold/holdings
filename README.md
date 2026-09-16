@@ -53,6 +53,7 @@ restic -r b2:bucket:repo ls --json latest | ./holdings.py import-restic restic-b
 ./holdings.py diff drive-a drive-b       # on A but not B
 ./holdings.py media                      # media overview
 ./holdings.py stats                      # totals
+./holdings.py due                        # what to re-read next, most urgent first
 ./holdings.py check                      # derived columns vs. the base tables
 ```
 
@@ -165,6 +166,28 @@ Every instance therefore also records `verified_at` and how it is known —
 ./holdings.py scan drive-bp /media/you/bp --full   # re-read and re-verify
 ./holdings.py redundancy --min-copies 2 --verified-within 365 --exit-code
 ```
+
+`due` turns that into a plan. `--verified-within` says which *content* is
+backed only by evidence nobody has refreshed; it does not say what to do,
+and the answer is per-medium — you dig one drive out of the safe and read
+it. `due` orders the media by how much that is worth:
+
+```
+$ holdings due
+MEDIUM                 LAST READ       AGE   SOLE BACKUP FOR   TO RE-READ  WHERE
+!drive-bp              2025-11-20     300d        2 (1.4 GB)       1.4 GB  budapest
+ drive-home            2026-09-16       0d          1 (7 MB)         7 MB  home
+
+1 medium(s) marked ! have not been read in 180 days.
+```
+
+*Sole backup for* is what re-reading would actually protect: content whose
+only backup copy is there. Ordering is deliberately explainable rather than
+a weighted score — media holding the only backup of something first, then
+the longest unread — because the output is a plan someone acts on, and a
+clever ranking nobody can predict is worse than a dull one.
+`--stale-after DAYS` (default 180) sets the threshold, and `--exit-code`
+makes it a cron line.
 
 A `--full` scan that finds different bytes at a known path now says so
 instead of quietly replacing the hash — on a medium nobody edits, that is
@@ -322,7 +345,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **141 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **151 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

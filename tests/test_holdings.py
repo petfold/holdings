@@ -1647,3 +1647,140 @@ def test_media_reports_when_it_was_last_actually_read(run, db, capsys,
     assert "LAST READ" in out
     with sqlite3.connect(db) as c:
         assert c.execute("SELECT verified_at FROM media").fetchone()[0]
+
+
+# ----------------------------------------------------- verification schedule
+
+@pytest.fixture
+def two_backups(run, tmp_path, capsys):
+    src, bp, home = tmp_path / "src", tmp_path / "bp", tmp_path / "home"
+    write(src / "shared.jpg", "shared")
+    write(bp / "shared.jpg", "shared")
+    write(bp / "only-backed-here.txt", "sole")
+    write(home / "other.txt", "other")
+    run("add-medium", "laptop", "--kind", "laptop", "--site", "home")
+    run("add-medium", "drive-bp", "--kind", "drive",
+        "--durability", "independent", "--site", "budapest")
+    run("add-medium", "drive-home", "--kind", "drive",
+        "--durability", "independent", "--site", "home")
+    run("scan", "laptop", str(src))
+    run("scan", "drive-bp", str(bp))
+    run("scan", "drive-home", str(home))
+    capsys.readouterr()
+    return run
+
+
+def age_medium(db, medium_id, days):
+    with sqlite3.connect(db) as c:
+        when = time.time() - days * 86400
+        c.execute("UPDATE instances SET verified_at=? WHERE medium_id=?",
+                  (when, medium_id))
+        c.execute("UPDATE media SET verified_at=? WHERE medium_id=?",
+                  (when, medium_id))
+
+
+def test_sole_backup_counts_what_re_reading_would_protect(two_backups, db):
+    """Distinct from only_here: a working copy may exist elsewhere, but
+    nothing else would survive deleting it."""
+    with sqlite3.connect(db) as c:
+        rows = dict(c.execute(
+            "SELECT medium_id, sole_backup_count FROM media"))
+    # shared.jpg: on laptop (working) + drive-bp -> drive-bp is its only
+    # backup. only-backed-here.txt: only on drive-bp. other.txt: only on
+    # drive-home.
+    assert rows == {"laptop": 0, "drive-bp": 2, "drive-home": 1}
+
+
+def test_a_working_medium_is_not_on_the_schedule(two_backups, capsys):
+    """You do not verify the copy you edit; it is the original."""
+    two_backups("due")
+    assert "laptop" not in capsys.readouterr().out
+
+
+def test_nothing_is_overdue_right_after_a_scan(two_backups, capsys):
+    two_backups("due", "--exit-code")            # no raise
+    assert "!" not in capsys.readouterr().out
+
+
+def test_an_unread_medium_becomes_overdue(two_backups, db, capsys):
+    age_medium(db, "drive-bp", 300)
+    with pytest.raises(SystemExit) as e:
+        two_backups("due", "--exit-code")
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "!drive-bp" in out and "300d" in out
+
+
+def test_the_staleness_threshold_is_the_users_to_set(two_backups, db,
+                                                     capsys):
+    age_medium(db, "drive-bp", 200)
+    with pytest.raises(SystemExit):
+        two_backups("due", "--stale-after", "180", "--exit-code")
+    capsys.readouterr()
+    two_backups("due", "--stale-after", "365", "--exit-code")   # no raise
+
+
+def test_media_holding_the_only_backup_outrank_older_ones(
+        two_backups, db, tmp_path, capsys):
+    """The primary key: what would hurt most to lose, before what has gone
+    longest unread. A medium whose content is backed up elsewhere too is
+    less urgent than one holding the only copy, however long ago it was
+    read."""
+    run = two_backups
+    # Give drive-home's content a second backup, so nothing is sole to it.
+    second = tmp_path / "second"
+    write(second / "other.txt", "other")
+    run("add-medium", "drive-spare", "--kind", "drive",
+        "--durability", "independent", "--site", "home")
+    run("scan", "drive-spare", str(second))
+    age_medium(db, "drive-home", 900)            # much older, nothing at stake
+    age_medium(db, "drive-bp", 10)               # recent, holds sole backups
+    capsys.readouterr()
+
+    run("due")
+    lines = [l for l in capsys.readouterr().out.splitlines() if "drive-" in l]
+    assert "drive-bp" in lines[0], lines
+
+
+def test_among_equals_the_longest_unread_comes_first(two_backups, db,
+                                                     capsys):
+    """The tiebreak, once the stakes are the same."""
+    age_medium(db, "drive-bp", 100)
+    age_medium(db, "drive-home", 400)
+    two_backups("due")
+    lines = [l for l in capsys.readouterr().out.splitlines() if "drive-" in l]
+    assert "drive-home" in lines[0] and "drive-bp" in lines[1], lines
+
+
+def test_due_json_gives_the_plan_as_data(two_backups, db, capsys):
+    age_medium(db, "drive-bp", 300)
+    with pytest.raises(SystemExit):
+        two_backups("due", "--json", "--exit-code")
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["overdue"] == 1
+    bp = next(m for m in doc["media"] if m["medium_id"] == "drive-bp")
+    assert bp["overdue"] is True
+    assert bp["sole_backup_for"] == 2
+    assert 299 < bp["days_since_verified"] < 301
+    assert bp["site"] == "budapest"
+
+
+def test_a_never_verified_medium_is_overdue(run, db, capsys, tmp_path):
+    """An imported listing is never read, so it never verifies anything."""
+    listing = tmp_path / "ls.json"
+    listing.write_text(json.dumps(
+        {"struct_type": "node", "type": "file", "path": "/x.pdf", "size": 9}))
+    run("add-medium", "r", "--kind", "restic-repo",
+        "--durability", "independent")
+    run("import-restic", "r", str(listing))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("due", "--exit-code")
+    assert "never" in capsys.readouterr().out
+
+
+def test_due_is_read_only_so_it_works_on_a_published_catalog():
+    import argparse
+    [subs] = [a for a in holdings.build_parser()._actions
+              if isinstance(a, argparse._SubParsersAction)]
+    assert subs.choices["due"].get_default("writes") is False

@@ -60,7 +60,12 @@ CREATE TABLE IF NOT EXISTS media (
     file_count      INTEGER NOT NULL DEFAULT 0, -- derived from instances
     byte_count      INTEGER NOT NULL DEFAULT 0,
     only_here_count INTEGER NOT NULL DEFAULT 0, -- content held nowhere else
-    only_here_bytes INTEGER NOT NULL DEFAULT 0
+    only_here_bytes INTEGER NOT NULL DEFAULT 0,
+    -- Content whose *only* backup copy is here. Distinct from only_here_*:
+    -- a working copy may exist elsewhere, but nothing else would survive
+    -- deleting it. This is what re-reading this medium actually protects.
+    sole_backup_count INTEGER NOT NULL DEFAULT 0,
+    sole_backup_bytes INTEGER NOT NULL DEFAULT 0
 );
 
 -- How many content objects sit at each backup-copy count. `redundancy`
@@ -192,6 +197,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         ("content", "backup_kinds", "INTEGER NOT NULL DEFAULT 0"),
         ("media", "lease_expires", "REAL"),
         ("media", "lease_checked", "REAL"),
+        ("media", "sole_backup_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("media", "sole_backup_bytes", "INTEGER NOT NULL DEFAULT 0"),
         ("media", "only_here_count", "INTEGER NOT NULL DEFAULT 0"),
         ("media", "only_here_bytes", "INTEGER NOT NULL DEFAULT 0"),
         ("content", "copies", "INTEGER NOT NULL DEFAULT 0"),
@@ -513,6 +520,16 @@ QUERIES = {
         " ORDER BY size DESC LIMIT ?",
     "only_on_totals":
         "SELECT only_here_count, only_here_bytes FROM media WHERE medium_id=?",
+    # The verification schedule. Everything it needs is already on the
+    # media row, so it is a handful of pages even against a published
+    # catalog -- which matters, because the answer to "what should I dig
+    # out of the safe next?" is most useful from a phone.
+    "due":
+        "SELECT medium_id, kind, durability, site, verified_at, last_scanned,"
+        "       file_count, byte_count, sole_backup_count, sole_backup_bytes"
+        "  FROM media WHERE durability <> 'working'"
+        " ORDER BY sole_backup_count > 0 DESC,"
+        "          verified_at IS NULL DESC, verified_at ASC",
     "newest_scan":
         "SELECT MAX(last_scanned) AS newest FROM media",
 }
@@ -648,6 +665,14 @@ def refresh_derived(conn) -> None:
         "  only_here_bytes = COALESCE((SELECT SUM(c.size) FROM instances i"
         "     JOIN content c ON c.hash = i.hash"
         "    WHERE i.medium_id = media.medium_id AND c.copies = 1), 0),"
+        "  sole_backup_count = (SELECT COUNT(*) FROM instances i"
+        "     JOIN content c ON c.hash = i.hash"
+        "    WHERE i.medium_id = media.medium_id AND media.is_backup"
+        "      AND c.backup_copies = 1),"
+        "  sole_backup_bytes = COALESCE((SELECT SUM(c.size) FROM instances i"
+        "     JOIN content c ON c.hash = i.hash"
+        "    WHERE i.medium_id = media.medium_id AND media.is_backup"
+        "      AND c.backup_copies = 1), 0),"
         "  verified_at = (SELECT MAX(verified_at) FROM instances"
         "                  WHERE medium_id = media.medium_id)")
     conn.execute("DELETE FROM backup_histogram")
@@ -725,15 +750,19 @@ def derived_drift(conn) -> list[str]:
             f"e.g. {off[0]}: stored {stored[off[0]]}, "
             f"recomputed {expected.get(off[0])}")
 
-    for mid, *stored_totals in conn.execute(
-            "SELECT medium_id, file_count, byte_count, only_here_count,"
-            "       only_here_bytes FROM media"):
+    for mid, backup, *stored_totals in conn.execute(
+            "SELECT medium_id, is_backup, file_count, byte_count,"
+            "       only_here_count, only_here_bytes,"
+            "       sole_backup_count, sole_backup_bytes FROM media"):
         real = conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(i.size), 0),"
             "       COALESCE(SUM(c.copies = 1), 0),"
-            "       COALESCE(SUM(CASE WHEN c.copies = 1 THEN c.size END), 0)"
+            "       COALESCE(SUM(CASE WHEN c.copies = 1 THEN c.size END), 0),"
+            "       COALESCE(SUM(? AND c.backup_copies = 1), 0),"
+            "       COALESCE(SUM(CASE WHEN ? AND c.backup_copies = 1"
+            "                         THEN c.size END), 0)"
             "  FROM instances i JOIN content c ON c.hash = i.hash"
-            " WHERE i.medium_id=?", (mid,)).fetchone()
+            " WHERE i.medium_id=?", (backup, backup, mid)).fetchone()
         if tuple(stored_totals) != tuple(real):
             problems.append(f"media '{mid}' totals stale: stored "
                             f"{tuple(stored_totals)}, recomputed {tuple(real)}")
@@ -758,6 +787,61 @@ def derived_drift(conn) -> list[str]:
     return problems
 
 
+def cmd_due(conn, args):
+    """What to re-read next, and what it would protect.
+
+    `--verified-within` says which content is backed only by evidence
+    nobody has refreshed. It does not say what to *do*, and the answer is
+    per-medium: you dig one drive out of the safe and read it. This orders
+    the media by how much that would be worth.
+
+    Ordering is deliberately explainable rather than a weighted score:
+    media that hold the only backup of something come first, then the
+    longest unverified. A clever ranking nobody can predict is worse than
+    a dull one, when the output is a plan someone acts on.
+    """
+    now = time.time()
+    rows = []
+    for (mid, kind, durability, site, verified, scanned, nfiles, nbytes,
+         sole_n, sole_b) in conn.execute(QUERIES["due"]):
+        age = None if verified is None else (now - verified) / 86400
+        rows.append({
+            "medium_id": mid, "kind": kind, "durability": durability,
+            "site": site, "verified_at": verified,
+            "days_since_verified": None if age is None else round(age, 1),
+            "overdue": age is None or age > args.stale_after,
+            "files": nfiles, "bytes": nbytes,
+            "sole_backup_for": sole_n, "sole_backup_bytes": sole_b,
+        })
+    overdue = [r for r in rows if r["overdue"]]
+
+    if emit_json(args, {"stale_after_days": args.stale_after,
+                        "overdue": len(overdue), "media": rows}):
+        policy_exit(args, len(overdue))
+        return
+
+    if not rows:
+        print("no backup media registered — nothing to verify")
+        return
+    print(f"{'MEDIUM':22} {'LAST READ':11} {'AGE':>7} {'SOLE BACKUP FOR':>17}"
+          f" {'TO RE-READ':>12}  WHERE")
+    for r in rows:
+        when = (time.strftime("%Y-%m-%d", time.localtime(r["verified_at"]))
+                if r["verified_at"] else "never")
+        age = ("—" if r["days_since_verified"] is None
+               else f"{r['days_since_verified']:.0f}d")
+        flag = "!" if r["overdue"] else " "
+        sole = (f"{r['sole_backup_for']} ({human_size(r['sole_backup_bytes'])})"
+                if r["sole_backup_for"] else "—")
+        print(f"{flag}{r['medium_id']:21} {when:11} {age:>7} {sole:>17}"
+              f" {human_size(r['bytes']):>12}  {r['site'] or '—'}")
+    if overdue:
+        print(f"\n{len(overdue)} medium(s) marked ! have not been read in"
+              f" {args.stale_after:.0f} days. Re-read one with:"
+              f"\n    holdings scan <medium> <mount> --full")
+    policy_exit(args, len(overdue))
+
+
 def cmd_check(conn, args):
     problems = derived_drift(conn)
     # Not drift -- the catalog is internally consistent -- but the same
@@ -775,6 +859,12 @@ def cmd_check(conn, args):
         print(f"DRIFT: {p}", file=sys.stderr)
     sys.exit("re-run `scan` on the affected media to rebuild derived state"
              " (it is a cache; the base tables are unaffected)")
+
+
+# How long a backup medium may go unread before it is worth re-reading.
+# Six months is a working default, not a law: the right number depends on
+# how long it takes to read the medium and how much sits only there.
+DEFAULT_STALE_AFTER_DAYS = 180.0
 
 
 # --------------------------------------------------------------------------
@@ -1432,6 +1522,15 @@ def build_parser():
 
     s = reads("stats", help="catalog totals")
     s.set_defaults(func=cmd_stats, writes=False)
+
+    s = reads("due", help="which media are overdue for re-reading")
+    s.add_argument("--stale-after", type=float, metavar="DAYS",
+                   default=DEFAULT_STALE_AFTER_DAYS,
+                   help="how long a medium may go unread before it counts as"
+                        f" overdue (default {DEFAULT_STALE_AFTER_DAYS:.0f})")
+    s.add_argument("--exit-code", action="store_true",
+                   help="exit 1 when any medium is overdue")
+    s.set_defaults(func=cmd_due, writes=False)
 
     s = reads("check",
                        help="verify derived columns against the base tables")
