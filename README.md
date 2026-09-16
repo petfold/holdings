@@ -127,9 +127,50 @@ price: if the price rises the batch drains faster than quoted, so the figure
 is an optimistic bound. holdings stores the estimate *and* when it was
 taken, and says so when an estimate has aged.
 
-holdings still cannot verify any of this — the class is your assertion when
-you register a medium. What it can do is stop one word standing in for five
+holdings still cannot verify a class — it is your assertion when you
+register a medium. What it can do is stop one word standing in for five
 different things.
+
+### Sites: what fails together
+
+Durability says what kills one copy. It does not say what kills several at
+once, and two drives in the same drawer as the laptop share fire, flood,
+theft and a ransomware process walking every mounted volume. Counted as two,
+they are closer to one.
+
+```bash
+./holdings.py add-medium drive-home --kind drive --durability independent --site home
+./holdings.py add-medium drive-bp   --kind drive --durability independent --site budapest
+
+# the whole of 3-2-1, not just the 3:
+./holdings.py redundancy --min-copies 2 --min-sites 2 --min-kinds 2 --exit-code
+```
+
+Media with no `--site` recorded collapse into a single unknown site rather
+than each counting separately: unknown is not the same as known-different,
+and under-counting separation is the safe direction.
+
+### Seen is not verified
+
+`seen_at` means the filesystem still listed the file at that size. It does
+**not** mean anyone read it: a rescan reuses the stored hash without opening
+the file, and bit rot changes neither size nor mtime. So a copy can be
+faithfully catalogued for years and be gone.
+
+Every instance therefore also records `verified_at` and how it is known —
+`hashed` (the bytes were read), `metadata` (the filesystem said so), or
+`imported` (a listing matched on name and size, the weakest of the three).
+
+```bash
+./holdings.py scan drive-bp /media/you/bp --full   # re-read and re-verify
+./holdings.py redundancy --min-copies 2 --verified-within 365 --exit-code
+```
+
+A `--full` scan that finds different bytes at a known path now says so
+instead of quietly replacing the hash — on a medium nobody edits, that is
+what rot looks like. And a file that cannot be read is kept and reported
+rather than pruned as deleted, because a failing drive and a tidied-up one
+must not produce the same catalog change.
 
 ## Reading a published catalog (optional)
 
@@ -260,7 +301,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **116 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **132 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.
