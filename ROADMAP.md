@@ -306,15 +306,23 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
         with one custodian leaves it unset, and unset is never read as
         zero.
 
-      * [ ] **Read the seed count from `rad`.** The number is settable by
-        hand; nothing fills it in. Deliberately not written blind: `rad`
-        was not installed here, so the parser could not be run against
-        real output — and this is the number that decides whether
-        something counts as a backup, which is the worst possible place to
-        guess. Two interface guesses already went wrong in one sitting
-        (`sha256sum -r` is BSD-only; Syncthing's REST shapes were nearly
-        invented before a live instance was started to read them). Wants
-        `rad sync status` or radicle-httpd against a real node.
+      * [x] **Read the seed count from `rad`** (DONE 2026-09-17):
+        `rad-seeds`. `rad node routing --json` is the one machine-readable
+        answer to "who has this repo" — JSON lines of {rid, nid} — and the
+        count is distinct nids minus this node's own. Everything else `rad`
+        prints is a box-drawn table meant for people; `rad sync status` on
+        a repo with no seeds prints only a legend.
+
+        Verified against a live node: 0 for a private repo nobody else
+        announces, 54 for heartwood, out of a routing table holding 13,685
+        repos.
+
+        It refuses rather than answers when the node is stopped. An empty
+        routing table spells "nobody has it" and "I have not asked anybody"
+        in the same characters, and reporting zero would strip a medium of
+        its backup status on no evidence — so the earlier count survives a
+        failed refresh. (`rad` also exits 0 while printing errors, so the
+        exit code is not load-bearing anywhere here.)
 
       * **Sync mirrors as a placement source** — v0.2's Syncthing REST
         adapter feeds `mirror`, and the class is now there to receive it.

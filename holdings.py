@@ -1452,6 +1452,106 @@ LISTING_FORMATS = {
 
 
 # --------------------------------------------------------------------------
+# Radicle
+# --------------------------------------------------------------------------
+
+# `rad node routing --json` is the one machine-readable answer to "who has
+# this repo": JSON lines of {"rid", "nid"}, one per repo/node pair, which is
+# the routing table the node has learned from the network. Everything else
+# `rad` prints is a box-drawn table meant for people.
+#
+# The count that matters is distinct nids *other than this node's own*. A
+# repo the local node alone announces is not replicated anywhere -- it is
+# the same machine, and counting it would be the error this whole class
+# exists to prevent.
+
+
+def rad(*args: str, home: str | None = None) -> tuple[int, str]:
+    import subprocess
+    env = dict(os.environ)
+    if home:
+        env["RAD_HOME"] = home
+    try:
+        out = subprocess.run(["rad", *args], capture_output=True, env=env,
+                             timeout=120)
+    except FileNotFoundError:
+        sys.exit("`rad` is not on PATH. Install Radicle, or pass --replicas"
+                 " by hand.")
+    except subprocess.TimeoutExpired:
+        sys.exit(f"`rad {' '.join(args)}` did not finish within 120s")
+    return out.returncode, out.stdout.decode(errors="replace")
+
+
+def rad_node_id(home: str | None) -> str:
+    code, out = rad("node", "status", "--only", "nid", home=home)
+    nid = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    if not nid.startswith("z6M"):
+        sys.exit("cannot read this node's own id from `rad node status"
+                 " --only nid`")
+    return nid
+
+
+def rad_seed_count(rid: str, home: str | None) -> int:
+    """Nodes announcing `rid`, not counting this one.
+
+    Refuses rather than answers when the node is not running. An empty
+    routing table means "nobody has it" and "I have not asked anybody" in
+    exactly the same characters, and those must not be confused: reporting
+    zero would strip a medium of its backup status on no evidence.
+
+    `rad` also exits 0 while printing an error, so the exit code is not
+    load-bearing here.
+    """
+    _, status = rad("node", "status", home=home)
+    if "is running" not in status:
+        sys.exit("the Radicle node is not running, so its routing table is"
+                 " empty -- which is not the same as having no seeds."
+                 " Start it with `rad node start` and try again.")
+
+    mine = rad_node_id(home)
+    _, table = rad("node", "routing", "--json", "--rid", rid, home=home)
+    nids = set()
+    for line in table.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("rid") == rid and row.get("nid"):
+            nids.add(row["nid"])
+    return len(nids - {mine})
+
+
+def cmd_rad_seeds(conn, args):
+    """Count who else seeds a Radicle repo, and record it on the medium."""
+    require_medium(conn, args.medium_id, "--durability hosted")
+    rid = args.rid
+    if not rid:
+        code, out = rad("inspect", "--rid", home=args.home)
+        rid = out.strip().splitlines()[-1].strip() if out.strip() else ""
+        if not rid.startswith("rad:"):
+            sys.exit("give --rid, or run this from inside a Radicle repo")
+    seeds = rad_seed_count(rid, args.home)
+    conn.execute("UPDATE media SET replicas=?, replicas_checked=?"
+                 " WHERE medium_id=?", (seeds, time.time(), args.medium_id))
+    refresh_derived(conn)
+    conn.commit()
+
+    if emit_json(args, {"medium_id": args.medium_id, "rid": rid,
+                        "seeds": seeds}):
+        return
+    print(f"{rid}: {seeds} seed(s) other than this node"
+          f" -- recorded on '{args.medium_id}'")
+    if seeds == 0:
+        print("This repo is announced by nobody else, so it is not a second"
+              " copy of anything and no longer counts as a backup. `rad"
+              " seed` it from another node, or ask someone to.",
+              file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
 # Syncthing
 # --------------------------------------------------------------------------
 
@@ -2221,6 +2321,14 @@ def build_parser():
                         " rclone: `rclone lsjson -R [--hash]`;"
                         " sha256sum: `sha256sum` output (exact, no sizes)")
     s.set_defaults(func=cmd_import, writes=True)
+
+    s = sub.add_parser("rad-seeds",
+                       help="count who else seeds a Radicle repo")
+    s.add_argument("medium_id")
+    s.add_argument("--rid", help="repo id (default: the repo you are in)")
+    s.add_argument("--home", help="RAD_HOME, if not the default")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_rad_seeds, writes=True)
 
     s = sub.add_parser("import-syncthing",
                        help="record what a Syncthing folder holds")
