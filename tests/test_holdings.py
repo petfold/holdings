@@ -618,8 +618,8 @@ def test_the_commands_that_write_are_the_ones_that_change_placement():
     [subs] = [a for a in holdings.build_parser()._actions
               if isinstance(a, argparse._SubParsersAction)]
     writers = {n for n, sp in subs.choices.items() if sp.get_default("writes")}
-    assert writers == {"add-medium", "scan", "import-restic", "import-swarm",
-                       "check-swarm"}
+    assert writers == {"add-medium", "scan", "import", "import-restic",
+                       "import-swarm", "check-swarm"}
 
 
 @pytest.mark.parametrize("argv", [
@@ -1822,9 +1822,11 @@ def test_import_swarm_records_the_reference_alongside_the_hash(
     assert evidence == "imported" and verified is None
 
 
-def test_import_swarm_matches_content_already_known_by_hash(
+def test_import_swarm_matches_known_content_by_name_and_size(
         run, db, tmp_path, capsys):
-    """Unambiguous name+size gets the real hash, so the copy counts."""
+    """Unambiguous name+size gets the real hash, so the copy counts. Note
+    the report distinguishes this from a hash the listing supplied: one is
+    a guess that happened to be unique, the other is exact."""
     src = tmp_path / "src"
     write(src / "holiday.jpg", "photo!")          # 6 bytes
     run("add-medium", "laptop", "--kind", "laptop")
@@ -1835,7 +1837,7 @@ def test_import_swarm_matches_content_already_known_by_hash(
         {"path": "holiday.jpg", "size": 6, "reference": "deadbeef"}])
     run("import-swarm", "swarm", listing)
     out = capsys.readouterr().out
-    assert "1 matched to content already known by hash" in out
+    assert "1 matched by name+size" in out and "0 by hash" in out
     with sqlite3.connect(db) as c:
         hashes = {h for h, in c.execute("SELECT hash FROM instances")}
     assert len(hashes) == 1 and hashes.pop().startswith("sha256:")
@@ -2155,3 +2157,178 @@ def test_a_plain_scoped_report_does_not_claim_unset_thresholds(
     before_a_reformat("redundancy", "--on", "laptop", "--min-copies", "1")
     out = capsys.readouterr().out
     assert "site" not in out and "SITE" not in out
+
+
+# ------------------------------------------------- one importer, many shapes
+
+@pytest.fixture
+def known_content(run, tmp_path, capsys):
+    """A laptop already scanned, so listings have something to match."""
+    src = tmp_path / "laptop"
+    write(src / "holiday.jpg", "photo content")
+    write(src / "thesis.pdf", "thesis text")
+    run("add-medium", "laptop", "--kind", "laptop")
+    run("scan", "laptop", str(src))
+    run("add-medium", "nas", "--kind", "other", "--durability", "independent")
+    capsys.readouterr()
+    return run
+
+
+def hash_of(db, path):
+    with sqlite3.connect(db) as c:
+        return c.execute("SELECT hash FROM instances WHERE path=?",
+                         (path,)).fetchone()[0]
+
+
+def listing(tmp_path, text):
+    f = tmp_path / "listing.txt"
+    f.write_text(text)
+    return str(f)
+
+
+def test_a_supplied_hash_is_exact_not_a_guess(known_content, db, tmp_path,
+                                              capsys):
+    """The whole point of the generic form: a backend that can produce a
+    sha256 gets exact placement, where name+size can only be a guess that
+    happened to be unique."""
+    run = known_content
+    digest = hash_of(db, "holiday.jpg").removeprefix("sha256:")
+    run("import", "nas", listing(tmp_path,
+        f"{digest}  ./backups/holiday.jpg\n"), "--format", "sha256sum")
+    out = capsys.readouterr().out
+    assert "2 entries" not in out and "1 by hash (exact)" in out
+    with sqlite3.connect(db) as c:
+        h = c.execute("SELECT hash FROM instances WHERE medium_id='nas'"
+                      ).fetchone()[0]
+    assert h == hash_of(db, "holiday.jpg")
+
+
+def test_sha256sum_supplies_no_size_so_the_hash_must_be_known(
+        known_content, tmp_path, capsys):
+    """Skipped and counted, never invented: a content row needs a size, and
+    guessing one would corrupt every byte total in the catalog."""
+    run = known_content
+    run("import", "nas", listing(tmp_path, f"{'a' * 64}  ./stranger.bin\n"),
+        "--format", "sha256sum")
+    cap = capsys.readouterr()
+    assert "0 entries" in cap.out
+    assert "1 entry(s) skipped" in cap.err
+
+
+def test_sha256sum_accepts_binary_mode_output(known_content, db, tmp_path,
+                                              capsys):
+    run = known_content
+    digest = hash_of(db, "thesis.pdf").removeprefix("sha256:")
+    run("import", "nas", listing(tmp_path, f"{digest} *thesis.pdf\n"),
+        "--format", "sha256sum")
+    assert "1 by hash (exact)" in capsys.readouterr().out
+
+
+def test_rclone_listings_use_a_hash_when_the_backend_has_one(
+        known_content, db, tmp_path, capsys):
+    run = known_content
+    digest = hash_of(db, "holiday.jpg").removeprefix("sha256:")
+    doc = json.dumps([
+        {"Path": "holiday.jpg", "Size": 13, "IsDir": False,
+         "Hashes": {"sha256": digest}},
+        {"Path": "somedir", "Size": -1, "IsDir": True},
+    ])
+    run("import", "nas", listing(tmp_path, doc), "--format", "rclone")
+    out = capsys.readouterr().out
+    assert "1 entries" in out and "1 by hash (exact)" in out
+
+
+def test_rclone_without_hashes_falls_back_to_name_and_size(
+        known_content, tmp_path, capsys):
+    run = known_content
+    doc = json.dumps([{"Path": "holiday.jpg", "Size": 13, "IsDir": False}])
+    run("import", "nas", listing(tmp_path, doc), "--format", "rclone")
+    assert "1 matched by name+size" in capsys.readouterr().out
+
+
+def test_jsonl_is_the_escape_hatch(known_content, db, tmp_path, capsys):
+    run = known_content
+    run("import", "nas", listing(tmp_path, json.dumps(
+        {"path": "a/b.bin", "size": 5, "reference": "xyz"}) + "\n"))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        h, ref = c.execute("SELECT hash, external_ref FROM instances"
+                           " WHERE medium_id='nas'").fetchone()
+    assert h.startswith("unverified:jsonl:") and ref == "xyz"
+
+
+def test_the_restic_format_matches_the_old_command(known_content, db,
+                                                   tmp_path, capsys):
+    """import-restic is kept as a name people have in their scripts; it must
+    keep producing the same rows as the generic form."""
+    run = known_content
+    doc = json.dumps({"struct_type": "node", "type": "file",
+                      "path": "/holiday.jpg", "size": 14}) + "\n"
+    run("add-medium", "r2", "--kind", "restic-repo", "--durability",
+        "independent")
+    run("import-restic", "nas", listing(tmp_path, doc))
+    run("import", "r2", listing(tmp_path, doc), "--format", "restic")
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        rows = {m: (p, sz) for m, p, sz in c.execute(
+            "SELECT medium_id, path, size FROM instances"
+            " WHERE medium_id IN ('nas','r2')")}
+    assert rows["nas"] == rows["r2"] == ("holiday.jpg", 14)
+
+
+def test_an_unidentified_file_is_not_assumed_shared_across_media(
+        known_content, db, tmp_path, capsys):
+    """Two media both listing a file nobody can identify are not evidence
+    that it is the same file. The placeholder carries the medium, so they
+    stay two content objects -- which understates redundancy rather than
+    overstating it, and that is the direction to err in."""
+    run = known_content
+    run("add-medium", "nas2", "--kind", "other", "--durability",
+        "independent")
+    doc = json.dumps({"path": "mystery.bin", "size": 999}) + "\n"
+    run("import", "nas", listing(tmp_path, doc))
+    run("import", "nas2", listing(tmp_path, doc))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        hashes = {h for h, in c.execute(
+            "SELECT hash FROM instances WHERE path='mystery.bin'")}
+        assert len(hashes) == 2
+        assert all(h.startswith("unverified:") for h in hashes)
+        assert c.execute("SELECT MAX(backup_copies) FROM content"
+                         " WHERE hash LIKE 'unverified:%'").fetchone()[0] == 1
+
+
+def test_snapshot_records_are_skipped(known_content, tmp_path, capsys):
+    run = known_content
+    doc = "\n".join([
+        json.dumps({"struct_type": "snapshot", "time": "2026-01-01"}),
+        json.dumps({"struct_type": "node", "type": "dir", "path": "/d"}),
+        json.dumps({"struct_type": "node", "type": "file",
+                    "path": "/d/f.txt", "size": 3}),
+    ]) + "\n"
+    run("import", "nas", listing(tmp_path, doc), "--format", "restic")
+    assert "1 entries" in capsys.readouterr().out
+
+
+def test_import_reports_each_kind_of_evidence_separately(known_content, db,
+                                                         tmp_path, capsys):
+    """by hash, by name+size, and unverified are three different claims and
+    the report keeps them apart."""
+    run = known_content
+    digest = hash_of(db, "holiday.jpg").removeprefix("sha256:")
+    doc = "\n".join([
+        json.dumps({"path": "exact.jpg", "size": 13, "hash": digest}),
+        json.dumps({"path": "thesis.pdf", "size": 11}),
+        json.dumps({"path": "stranger.bin", "size": 77}),
+    ]) + "\n"
+    run("import", "nas", listing(tmp_path, doc))
+    out = capsys.readouterr().out
+    assert "1 by hash (exact)" in out
+    assert "1 matched by name+size" in out
+    assert "1 unverified" in out
+
+
+def test_import_refuses_an_unregistered_medium(run, tmp_path):
+    with pytest.raises(SystemExit) as e:
+        run("import", "nope", listing(tmp_path, "{}\n"))
+    assert "register it first" in str(e.value)

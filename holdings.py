@@ -1288,46 +1288,161 @@ def cmd_check_swarm(conn, args):
     policy_exit(args, len(missing))
 
 
-def cmd_import_swarm(conn, args):
-    """Record what a published Swarm root holds, as a medium.
+# --------------------------------------------------------------------------
+# Listings
+# --------------------------------------------------------------------------
 
-    The same shape as import-restic, and the same honesty about it: a
-    listing gives paths and sizes, not content hashes, so entries are
-    matched to known content where that is unambiguous and recorded as
-    `unverified:` where it is not. For exact hashes, mount the root and
-    `scan` it -- reading the bytes is the only thing that proves them.
+# restic, rclone, an S3 bucket, a Swarm manifest, a `sha256sum` run over ssh:
+# every one of them is the same shape -- a sequence of (path, size) with, if
+# you are lucky, a hash or an address alongside. One reader, several parsers,
+# rather than a command per backend.
+#
+# A parser yields dicts with `path`, `size`, and optionally `hash` (sha256
+# hex, which makes placement exact) and `ref` (how the medium names the copy).
 
-    What Swarm adds over a restic listing is a per-file reference. Content
-    hash stays the identity; the reference is an address, and storing it is
-    what lets a copy be checked later without downloading it again.
+def parse_jsonl(stream):
+    """One JSON object per line: {path, size, hash?, reference?}.
+
+    The escape hatch. Anything that can be turned into this can be
+    imported, which is why the other parsers are conveniences rather than
+    the interface.
     """
-    medium = conn.execute("SELECT medium_id FROM media WHERE medium_id=?",
-                          (args.medium_id,)).fetchone()
-    if not medium:
-        sys.exit(f"unknown medium '{args.medium_id}' -- register it first"
-                 f" with add-medium (--durability leased, if it is stamped)")
-
-    started = time.time()
-    if args.root:
-        entries = swarm_listing(args.root, args.api_url)
-    else:
-        stream = sys.stdin if args.listing == "-" else open(args.listing)
-        entries = (json.loads(line) for line in stream if line.strip())
-
-    count = exact = 0
-    for e in entries:
-        path = str(e.get("path", "")).lstrip("/")
-        size = e.get("size")
-        if not path or size is None:
+    for line in stream:
+        line = line.strip()
+        if not line:
             continue
-        h = match_known_content(conn, path, size)
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("path") is None:
+            continue
+        yield {"path": str(obj["path"]), "size": obj.get("size"),
+               "hash": obj.get("hash"),
+               "ref": obj.get("reference") or obj.get("ref")}
+
+
+def parse_restic(stream):
+    """`restic -r <repo> ls --json <snapshot>`. No hashes: restic's index is
+    its own, so identity has to be matched by name and size."""
+    for line in stream:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "file" or obj.get("struct_type") == "snapshot":
+            continue
+        yield {"path": obj.get("path", ""), "size": obj.get("size", 0),
+               "hash": None, "ref": None}
+
+
+def parse_rclone(stream):
+    """`rclone lsjson -R [--hash] remote:path`, which is a JSON array.
+
+    Worth the special case because rclone speaks to most of the backends
+    people actually use, and on the ones that can produce SHA-256 it hands
+    over an exact identity rather than a guess.
+    """
+    try:
+        items = json.loads(stream.read() or "[]")
+    except json.JSONDecodeError:
+        return
+    for obj in items:
+        if obj.get("IsDir"):
+            continue
+        hashes = obj.get("Hashes") or {}
+        yield {"path": obj.get("Path", ""), "size": obj.get("Size"),
+               "hash": hashes.get("sha256") or hashes.get("SHA-256"),
+               "ref": obj.get("ID")}
+
+
+def parse_sha256sum(stream):
+    """`sha256sum` output: "<hex>  <path>", or "<hex> *<path>" in binary
+    mode. Exact identity, no size -- which is the trade.
+
+    The point of it: catalogue a machine you cannot mount, exactly, with
+    nothing installed at the far end --
+
+        ssh nas 'cd /data && find . -type f -exec sha256sum {} +' \\
+            | holdings import nas - --format sha256sum
+
+    (`-r` is a BSD flag; GNU coreutils has no recursive mode, hence find.)
+    """
+    for line in stream:
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2 or len(parts[0]) != 64:
+            continue
+        digest, path = parts
+        try:
+            int(digest, 16)
+        except ValueError:
+            continue
+        yield {"path": path.lstrip("*").lstrip("./"), "size": None,
+               "hash": digest, "ref": None}
+
+
+LISTING_FORMATS = {
+    "jsonl": parse_jsonl,
+    "restic": parse_restic,
+    "rclone": parse_rclone,
+    "sha256sum": parse_sha256sum,
+}
+
+
+def ingest_listing(conn, medium_id: str, entries, source: str) -> dict:
+    """Record a listing as placement on `medium_id`.
+
+    Identity, in order of how much it is worth:
+
+    * a sha256 in the listing is taken as given -- exact, no guessing;
+    * otherwise name+size is matched against content already known, and
+      used only when it is unambiguous;
+    * otherwise the entry is recorded under an `unverified:` placeholder,
+      which keeps the file visible without pretending to know what it is.
+
+    A listing never proves bytes. Mounting the source and scanning it is
+    still the only thing that does.
+    """
+    started = time.time()
+    stats = {"entries": 0, "by_hash": 0, "matched": 0, "unverified": 0,
+             "skipped": 0}
+    for e in entries:
+        path = str(e.get("path") or "").lstrip("/")
+        if not path:
+            continue
+        size, given = e.get("size"), e.get("hash")
+        h = None
+        if given:
+            h = given if ":" in given else f"sha256:{given}"
+            row = conn.execute("SELECT size FROM content WHERE hash=?",
+                               (h,)).fetchone()
+            if row:
+                size = row[0] if size is None else size
+            elif size is None:
+                # A hash this catalog has never seen, and no size to record
+                # with it. Better skipped and counted than invented.
+                stats["skipped"] += 1
+                continue
+            stats["by_hash"] += 1
+        if size is None:
+            stats["skipped"] += 1
+            continue
         if h is None:
-            h = f"unverified:swarm:{args.medium_id}:{path}:{size}"
-            conn.execute(
-                "INSERT INTO content (hash, size, first_seen) VALUES (?,?,?)"
-                " ON CONFLICT(hash) DO NOTHING", (h, size, time.time()))
-        else:
-            exact += 1
+            h = match_known_content(conn, path, size)
+            if h is None:
+                h = f"unverified:{source}:{medium_id}:{path}:{size}"
+                stats["unverified"] += 1
+            else:
+                stats["matched"] += 1
+        conn.execute(
+            "INSERT INTO content (hash, size, first_seen) VALUES (?,?,?)"
+            " ON CONFLICT(hash) DO NOTHING", (h, size, time.time()))
         conn.execute(
             "INSERT INTO instances"
             " (medium_id, path, name, hash, size, mtime, seen_at, evidence,"
@@ -1337,85 +1452,88 @@ def cmd_import_swarm(conn, args):
             "   name=excluded.name, hash=excluded.hash, size=excluded.size,"
             "   seen_at=excluded.seen_at, evidence=excluded.evidence,"
             "   external_ref=excluded.external_ref",
-            (args.medium_id, path, basename(path), h, size, time.time(),
-             e.get("reference")))
-        count += 1
+            (medium_id, path, basename(path), h, size, time.time(),
+             e.get("ref")))
+        stats["entries"] += 1
 
     conn.execute("DELETE FROM instances WHERE medium_id=? AND seen_at<?",
-                 (args.medium_id, started))
+                 (medium_id, started))
     conn.execute("UPDATE media SET last_scanned=? WHERE medium_id=?",
-                 (time.time(), args.medium_id))
+                 (time.time(), medium_id))
     refresh_derived(conn)
     conn.commit()
-    print(f"imported {count} entries into '{args.medium_id}'"
-          f" ({exact} matched to content already known by hash,"
-          f" {count - exact} recorded as unverified)")
-    if count:
-        print("note: a listing proves paths and sizes, not bytes. For exact"
-              " hashes, mount the root and `scan` it.", file=sys.stderr)
+    return stats
+
+
+def report_listing(medium_id: str, stats: dict) -> None:
+    print(f"imported {stats['entries']} entries into '{medium_id}':"
+          f" {stats['by_hash']} by hash (exact),"
+          f" {stats['matched']} matched by name+size,"
+          f" {stats['unverified']} unverified")
+    if stats["skipped"]:
+        print(f"note: {stats['skipped']} entry(s) skipped -- a hash this"
+              f" catalog has never seen, with no size to record it under."
+              f" Scan the source, or supply sizes.", file=sys.stderr)
+    if stats["unverified"] or stats["matched"]:
+        print("note: a listing proves paths and sizes, not bytes. Mount the"
+              " source and `scan` it for exact hashes.", file=sys.stderr)
+
+
+def require_medium(conn, medium_id: str, hint: str) -> None:
+    if not conn.execute("SELECT 1 FROM media WHERE medium_id=?",
+                        (medium_id,)).fetchone():
+        sys.exit(f"unknown medium '{medium_id}' -- register it first"
+                 f" with add-medium ({hint})")
+
+
+def open_listing(path: str):
+    return sys.stdin if path == "-" else open(path)
+
+
+def cmd_import(conn, args):
+    """Record any listing of paths and sizes as placement on a medium."""
+    require_medium(conn, args.medium_id, "--durability says what it survives")
+    with open_listing(args.listing) as stream:
+        stats = ingest_listing(conn, args.medium_id,
+                               LISTING_FORMATS[args.format](stream),
+                               args.format)
+    report_listing(args.medium_id, stats)
+
+
+def cmd_import_swarm(conn, args):
+    """Record what a published Swarm root holds.
+
+    `import --format jsonl` with two conveniences: it can fetch the listing
+    from a node itself, and it carries each file's Swarm reference through
+    to `external_ref`, which is what `check-swarm` later probes.
+    """
+    require_medium(conn, args.medium_id,
+                   "--durability leased, if it is stamped")
+    if args.root:
+        stats = ingest_listing(conn, args.medium_id,
+                               ({"path": e["path"], "size": e["size"],
+                                 "ref": e["reference"]}
+                                for e in swarm_listing(args.root,
+                                                       args.api_url)),
+                               "swarm")
+    else:
+        with open_listing(args.listing) as stream:
+            stats = ingest_listing(conn, args.medium_id, parse_jsonl(stream),
+                                   "swarm")
+    report_listing(args.medium_id, stats)
 
 
 def cmd_import_restic(conn, args):
-    """Ingest `restic ls --json <snapshot>` output so backup copies count.
+    """`restic -r <repo> ls --json latest | holdings import-restic restic-b2 -`
 
-    Usage:
-      restic -r <repo> ls --json latest | holdings import-restic restic-b2 -
-    or with a saved file:
-      holdings import-restic restic-b2 listing.json
+    Kept as a name people already have in their fingers and their scripts;
+    it is `import --format restic`.
     """
-    medium = conn.execute("SELECT medium_id FROM media WHERE medium_id=?",
-                          (args.medium_id,)).fetchone()
-    if not medium:
-        sys.exit(f"unknown medium '{args.medium_id}' — register it first"
-                 f" (kind=restic-repo, --backup)")
-
-    stream = sys.stdin if args.listing == "-" else open(args.listing)
-    started = time.time()
-    count = 0
-    with stream:
-        for line in stream:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if obj.get("type") != "file" or obj.get("struct_type") == "snapshot":
-                continue
-            path = obj.get("path", "").lstrip("/")
-            size = obj.get("size", 0)
-            # restic ls --json does not expose content hashes; identity is
-            # matched by (size, name) against known content when unique,
-            # otherwise recorded as unverified. For exact matching, scan the
-            # restored/mounted repo (restic mount) with `holdings scan`.
-            h = match_known_content(conn, path, size)
-            if h is None:
-                h = f"unverified:restic:{args.medium_id}:{path}:{size}"
-                conn.execute(
-                    "INSERT INTO content (hash, size, first_seen) VALUES (?,?,?)"
-                    " ON CONFLICT(hash) DO NOTHING", (h, size, time.time()))
-            conn.execute(
-                "INSERT INTO instances"
-                " (medium_id, path, name, hash, size, mtime, seen_at,"
-                "  evidence)"
-                " VALUES (?,?,?,?,?,NULL,?,'imported')"
-                " ON CONFLICT(medium_id, path) DO UPDATE SET"
-                "   name=excluded.name, hash=excluded.hash,"
-                "   size=excluded.size, seen_at=excluded.seen_at,"
-                "   evidence=excluded.evidence",
-                (args.medium_id, path, basename(path), h, size, time.time()))
-            count += 1
-    conn.execute(
-        "DELETE FROM instances WHERE medium_id=? AND seen_at<?",
-        (args.medium_id, started))
-    conn.execute("UPDATE media SET last_scanned=? WHERE medium_id=?",
-                 (time.time(), args.medium_id))
-    refresh_derived(conn)
-    conn.commit()
-    print(f"imported {count} entries into '{args.medium_id}'"
-          f" (exact hashes where filename+size uniquely matched known content;"
-          f" run `restic mount` + `holdings scan` for exact verification)")
+    require_medium(conn, args.medium_id, "kind=restic-repo")
+    with open_listing(args.listing) as stream:
+        stats = ingest_listing(conn, args.medium_id, parse_restic(stream),
+                               "restic")
+    report_listing(args.medium_id, stats)
 
 
 def match_known_content(conn, path: str, size: int):
@@ -1764,6 +1882,19 @@ def build_parser():
                    help="exit 1 when anything is not retrievable")
     s.add_argument("--api-url")
     s.set_defaults(func=cmd_check_swarm, writes=True)
+
+    s = sub.add_parser("import",
+                       help="record any listing of paths and sizes")
+    s.add_argument("medium_id")
+    s.add_argument("listing", nargs="?", default="-",
+                   help="listing file, or '-' for stdin")
+    s.add_argument("--format", choices=sorted(LISTING_FORMATS),
+                   default="jsonl",
+                   help="jsonl: {path,size,hash?,reference?} per line;"
+                        " restic: `restic ls --json`;"
+                        " rclone: `rclone lsjson -R [--hash]`;"
+                        " sha256sum: `sha256sum` output (exact, no sizes)")
+    s.set_defaults(func=cmd_import, writes=True)
 
     s = sub.add_parser("import-restic",
                        help="ingest `restic ls --json` output ('-' = stdin)")
