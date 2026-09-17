@@ -43,6 +43,42 @@ export HOLDINGS_DB=~/Sync/catalog/catalog.sqlite   # put it in a synced folder
 restic -r b2:bucket:repo ls --json latest | ./holdings.py import-restic restic-b2 -
 ```
 
+### Importing from anything that can list itself
+
+restic, rclone, an S3 bucket, a Swarm manifest, a machine you can only
+reach over ssh — all the same shape: paths and sizes, sometimes with a hash
+or an address alongside. One command reads them:
+
+```bash
+# rclone, and on backends that can produce SHA-256 the placement is exact:
+rclone lsjson -R --hash remote:path | ./holdings.py import b2 - --format rclone
+
+# a machine you cannot mount, catalogued exactly, nothing installed at the far end:
+ssh nas 'cd /data && find . -type f -exec sha256sum {} +' \
+    | ./holdings.py import nas - --format sha256sum
+
+# anything else, via the escape hatch: {path, size, hash?, reference?}
+./holdings.py import mymedium listing.jsonl
+```
+
+The report keeps three different claims apart, because they are worth
+different amounts:
+
+```
+imported 412 entries into 'nas': 412 by hash (exact),
+  0 matched by name+size, 0 unverified
+```
+
+**by hash** is exact — the listing supplied a sha256. **matched by
+name+size** is a guess that happened to be unique. **unverified** is a
+placeholder that keeps the file visible without pretending to know what it
+is; those carry the medium's name, so the same unidentified file on two
+media stays two objects rather than being assumed shared, which understates
+redundancy instead of overstating it.
+
+A listing never proves bytes. Mounting the source and scanning it still is
+the only thing that does.
+
 ## Queries
 
 ```bash
@@ -414,7 +450,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **175 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **186 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

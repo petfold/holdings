@@ -256,8 +256,22 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
 
         Needs no optional extra: urllib and a reachable node.
 
-      * **A generic listing importer** — restic, S3/B2, rclone and Swarm
-        are one shape (a listing of paths and sizes), not four readers.
+      * [x] **A generic listing importer** (DONE 2026-09-17): `import
+        --format {jsonl,restic,rclone,sha256sum}`, with `import-restic` and
+        `import-swarm` kept as names people have in their scripts and
+        reduced to thin wrappers over the same core.
+
+        The reason it was worth doing properly rather than adding a fifth
+        reader: the generic form can carry a **sha256**, so a backend that
+        can produce one gets exact placement instead of a name+size guess.
+        `rclone lsjson --hash` does on several backends, and `sha256sum`
+        over ssh does everywhere — which catalogues a machine you cannot
+        mount, exactly, with nothing installed at the far end.
+
+        The report now separates by-hash, matched-by-name+size and
+        unverified, because they are three different claims. `sha256sum`
+        gives no sizes, so an entry whose hash the catalog has never seen is
+        skipped and counted rather than recorded with an invented size.
       * **Hubs** — needs git-awareness, not a directory scan: only content
         committed *and* pushed *and* still reachable from a remote ref is
         there. `hosted` is the class; the reader is the work. Radicle sits
