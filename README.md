@@ -249,6 +249,31 @@ what rot looks like. And a file that cannot be read is kept and reported
 rather than pruned as deleted, because a failing drive and a tidied-up one
 must not produce the same catalog change.
 
+### Syncthing
+
+A synced folder is scannable as an ordinary path, so why ask Syncthing?
+Because a scan tells you what *this* machine holds, and Syncthing already
+knows what the whole cluster holds and how complete each device is — facts
+about machines you cannot scan.
+
+```bash
+./holdings.py import-syncthing                      # which folders exist?
+./holdings.py add-medium nas --kind other --durability mirror --site attic
+./holdings.py import-syncthing nas --folder docs
+```
+
+The API key is found in Syncthing's own config if you do not pass one.
+
+Two things it is careful about. `db/browse` returns the **cluster's index** —
+what the devices agree the folder contains — not one device's disk, so a
+device below 100% is flagged rather than credited with copies it has not
+finished receiving. And other devices sharing the folder are pointed out,
+never counted: each is its own medium, and silently assuming them would
+invent copies nobody asked about.
+
+Everything it records is a `mirror`. Two copies, no backups — which is what
+`redundancy --on laptop` will tell you, and it is right.
+
 ### Hubs: GitHub, Hugging Face, Radicle
 
 A git remote is a `hosted` medium — the copy survives deleting your working
@@ -495,7 +520,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **199 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **213 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

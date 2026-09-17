@@ -1396,6 +1396,130 @@ LISTING_FORMATS = {
 
 
 # --------------------------------------------------------------------------
+# Syncthing
+# --------------------------------------------------------------------------
+
+# Scanning a synced directory tells you what *this* machine holds. Syncthing
+# already knows what the whole cluster holds, and which devices are actually
+# up to date -- facts about machines you cannot scan, which is the only
+# reason to prefer the API over a directory walk.
+#
+# Whatever it reports is a `mirror`: deletions propagate, so these copies
+# protect against losing a device and nothing else. The class exists; this
+# just fills it.
+
+SYNCTHING_HOMES = (
+    "~/.local/state/syncthing/config.xml",
+    "~/.config/syncthing/config.xml",
+    "~/Library/Application Support/Syncthing/config.xml",
+)
+
+
+def syncthing_api_key(explicit: str | None, home: str | None) -> str:
+    """The API key, from the flag, the environment, or Syncthing's config."""
+    if explicit:
+        return explicit
+    if os.environ.get("SYNCTHING_API_KEY"):
+        return os.environ["SYNCTHING_API_KEY"]
+    import xml.etree.ElementTree as ET
+    candidates = ([os.path.join(home, "config.xml")] if home
+                  else [os.path.expanduser(p) for p in SYNCTHING_HOMES])
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            key = ET.parse(path).getroot().findtext("./gui/apikey")
+        except ET.ParseError:
+            continue
+        if key:
+            return key
+    sys.exit("cannot find Syncthing's API key. Pass --api-key, set"
+             " SYNCTHING_API_KEY, or point --home at the config directory"
+             " (Actions > Settings > GUI in the web UI shows the key).")
+
+
+def syncthing_get(api_url: str, key: str, path: str, timeout: float = 30.0):
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(f"{api_url.rstrip('/')}/rest/{path}",
+                                 headers={"X-API-Key": key})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            sys.exit(f"Syncthing rejected the API key ({e.code})")
+        sys.exit(f"Syncthing returned {e.code} for /rest/{path}")
+    except (urllib.error.URLError, OSError) as e:
+        sys.exit(f"cannot reach Syncthing at {api_url}: {e}")
+
+
+def flatten_browse(entries, prefix: str = ""):
+    """`db/browse` answers with a tree; placement wants paths."""
+    for e in entries or ():
+        name = e.get("name", "")
+        path = f"{prefix}{name}"
+        if e.get("type") == "FILE_INFO_TYPE_DIRECTORY":
+            yield from flatten_browse(e.get("children"), f"{path}/")
+        elif e.get("type") == "FILE_INFO_TYPE_FILE":
+            yield {"path": path, "size": e.get("size"), "hash": None,
+                   "ref": None}
+
+
+def cmd_import_syncthing(conn, args):
+    """Record what a Syncthing folder holds, from the cluster's index.
+
+    With no --folder, lists the folders it can see and stops -- the folder
+    id is rarely the thing anyone remembers.
+    """
+    key = syncthing_api_key(args.api_key, args.home)
+    api = args.api_url
+    folders = syncthing_get(api, key, "config/folders") or []
+
+    if not args.folder:
+        print(f"{'FOLDER':24} {'LABEL':20} {'DEVICES':>7}  PATH")
+        for f in folders:
+            print(f"{f.get('id', ''):24} {f.get('label', ''):20}"
+                  f" {len(f.get('devices') or []):>7}  {f.get('path', '')}")
+        print("\nPick one with --folder, and register the medium as"
+              " --durability mirror: a sync target is not a backup.")
+        return
+
+    folder = next((f for f in folders if f.get("id") == args.folder), None)
+    if folder is None:
+        sys.exit(f"Syncthing has no folder '{args.folder}'"
+                 f" (run without --folder to list them)")
+    require_medium(conn, args.medium_id, "--durability mirror")
+
+    device = args.device or (syncthing_get(api, key, "system/status") or {}
+                             ).get("myID")
+    stats = ingest_listing(
+        conn, args.medium_id,
+        flatten_browse(syncthing_get(api, key,
+                                     f"db/browse?folder={args.folder}")),
+        "syncthing")
+    report_listing(args.medium_id, stats)
+
+    # The index is what the cluster agrees exists. A device below 100% does
+    # not hold all of it, and recording the index against that device would
+    # claim copies it has not got.
+    done = syncthing_get(api, key,
+                         f"db/completion?folder={args.folder}&device={device}")
+    pct = (done or {}).get("completion")
+    if pct is not None and pct < 100:
+        print(f"WARNING: device {device[:7]}… is {pct:.1f}% complete for"
+              f" '{args.folder}' -- it does not hold everything recorded"
+              f" above. Let it finish syncing and import again.",
+              file=sys.stderr)
+    others = [d.get("deviceID") for d in (folder.get("devices") or [])
+              if d.get("deviceID") != device]
+    if others:
+        print(f"note: {len(others)} other device(s) share this folder. Each"
+              f" is its own medium -- import them separately if you want"
+              f" them counted.", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
 # Git remotes as media
 # --------------------------------------------------------------------------
 
@@ -2036,6 +2160,17 @@ def build_parser():
                         " rclone: `rclone lsjson -R [--hash]`;"
                         " sha256sum: `sha256sum` output (exact, no sizes)")
     s.set_defaults(func=cmd_import, writes=True)
+
+    s = sub.add_parser("import-syncthing",
+                       help="record what a Syncthing folder holds")
+    s.add_argument("medium_id", nargs="?", default="")
+    s.add_argument("--folder", help="folder id (omit to list folders)")
+    s.add_argument("--device", help="which device this medium is"
+                                    " (default: the local one)")
+    s.add_argument("--api-url", default="http://127.0.0.1:8384")
+    s.add_argument("--api-key")
+    s.add_argument("--home", help="Syncthing's config directory")
+    s.set_defaults(func=cmd_import_syncthing, writes=True)
 
     s = sub.add_parser("import-git",
                        help="record what a git remote holds (GitHub,"

@@ -30,9 +30,20 @@ Goal: answer "which media hold which files?" from a single stdlib-only script.
 
 ## v0.2 — Syncthing REST adapter
 
-- [ ] Read placement from Syncthing's REST API rather than inferring it from
-      a scan of the synced directory. (Syncthing as a source of facts about
-      where files are — independent of what carries the catalog.)
+- [x] **Read placement from Syncthing's REST API** (DONE 2026-09-17):
+      `import-syncthing`. A scan of the synced directory says what this
+      machine holds; the API says what the cluster holds and how complete
+      each device is — facts about machines you cannot scan, which is the
+      only reason to prefer it over a directory walk.
+
+      `db/browse` is the cluster's index rather than one device's disk, so
+      a device below 100% is reported rather than credited with copies it
+      has not received, and the other devices sharing a folder are pointed
+      out rather than counted — each is its own medium. Everything recorded
+      is a `mirror`, so two copies and no backups is the honest result.
+
+      Response shapes were taken from a live instance, not guessed; the
+      tests stub those shapes so the suite stays offline.
 
 ## v0.3 — OntoDAG join live
 
