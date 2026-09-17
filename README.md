@@ -329,8 +329,22 @@ because seeds unseed and nothing writes to the catalog when they do.
 A hub with a single custodian leaves `--replicas` unset: the question does
 not arise there, and unset is never read as zero.
 
-Filling the number in from `rad` automatically is not done — see
-[ROADMAP.md](ROADMAP.md).
+Or let the node count for you:
+
+```bash
+./holdings.py rad-seeds radicle --rid rad:z3gqcJUoA1n9HaHKufZs5FCSGazv5
+# rad:z3gqcJUoA1n9HaHKufZs5FCSGazv5: 54 seed(s) other than this node
+```
+
+It reads `rad node routing --json`, the routing table the node has learned,
+and counts distinct nodes announcing the repo minus your own. Run it from
+inside a Radicle repo and the `--rid` is inferred.
+
+One thing it will not do is answer when it cannot see: if the node is
+stopped the routing table is empty, and "nobody has it" and "I have not
+asked anybody" look identical. Rather than report zero and quietly strip a
+medium of its backup status, it refuses and leaves the previous count
+alone.
 
 ### Swarm as a medium
 
@@ -533,7 +547,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **221 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **229 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

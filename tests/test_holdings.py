@@ -620,7 +620,7 @@ def test_the_commands_that_write_are_the_ones_that_change_placement():
     writers = {n for n, sp in subs.choices.items() if sp.get_default("writes")}
     assert writers == {"add-medium", "scan", "import", "import-restic",
                        "import-swarm", "import-git", "import-syncthing",
-                       "check-swarm"}
+                       "check-swarm", "rad-seeds"}
 
 
 @pytest.mark.parametrize("argv", [
@@ -2455,3 +2455,138 @@ def test_media_shows_the_seed_count(seeded, capsys):
     capsys.readouterr()
     run("media")
     assert "hosted×2" in capsys.readouterr().out
+
+
+# ---------------------------------------------------- counting Radicle seeds
+
+# `rad node routing --json` is JSON lines of {"rid","nid"} -- the shapes here
+# were read off a live node, which knew 13,685 repos and put heartwood at 54
+# seeds. The stub replays that shape so the suite needs no node.
+
+MY_NID = "z6MkMINE"
+
+
+def stub_rad(monkeypatch, routing_nids, running=True, rid="rad:zTEST"):
+    calls = []
+
+    def fake(*args, home=None):
+        calls.append(args)
+        if args[:2] == ("node", "status") and "--only" in args:
+            return 0, MY_NID + "\n"
+        if args[:2] == ("node", "status"):
+            return 0, ("✓ Node is running with Node ID " + MY_NID
+                       if running else "Node is stopped.")
+        if args[:2] == ("node", "routing"):
+            return 0, "".join(
+                json.dumps({"rid": rid, "nid": n}) + "\n" for n in routing_nids)
+        if args[:2] == ("inspect", "--rid"):
+            return 0, rid + "\n"
+        return 0, ""
+
+    monkeypatch.setattr(holdings, "rad", fake)
+    return calls
+
+
+@pytest.fixture
+def rad_medium(run, capsys):
+    run("add-medium", "radicle", "--kind", "other", "--durability", "hosted")
+    capsys.readouterr()
+    return run
+
+
+def test_seeds_are_counted_excluding_this_node(rad_medium, db, monkeypatch,
+                                               capsys):
+    """The distinction the whole feature rests on: a repo your own node
+    announces is not thereby replicated."""
+    stub_rad(monkeypatch, [MY_NID, "z6MkA", "z6MkB"])
+    rad_medium("rad-seeds", "radicle", "--rid", "rad:zTEST")
+    assert "2 seed(s) other than this node" in capsys.readouterr().out
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT replicas FROM media").fetchone()[0] == 2
+
+
+def test_a_node_announced_twice_is_still_one_node(rad_medium, db,
+                                                  monkeypatch, capsys):
+    stub_rad(monkeypatch, ["z6MkA", "z6MkA", "z6MkA"])
+    rad_medium("rad-seeds", "radicle", "--rid", "rad:zTEST")
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT replicas FROM media").fetchone()[0] == 1
+
+
+def test_seeded_only_by_you_stops_counting_as_a_backup(rad_medium, db,
+                                                       monkeypatch, capsys):
+    stub_rad(monkeypatch, [MY_NID])
+    rad_medium("rad-seeds", "radicle", "--rid", "rad:zTEST")
+    err = capsys.readouterr().err
+    assert "announced by nobody else" in err
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT replicas, is_backup FROM media"
+                         ).fetchone() == (0, 0)
+
+
+def test_a_stopped_node_refuses_instead_of_reporting_zero(rad_medium, db,
+                                                          monkeypatch,
+                                                          capsys):
+    """The dangerous case. An empty routing table spells "nobody has it" and
+    "I have not asked anybody" identically, and reporting zero would strip a
+    medium of its backup status on no evidence."""
+    stub_rad(monkeypatch, ["z6MkA", "z6MkB"])
+    rad_medium("rad-seeds", "radicle", "--rid", "rad:zTEST")
+    capsys.readouterr()
+
+    stub_rad(monkeypatch, [], running=False)
+    with pytest.raises(SystemExit) as e:
+        rad_medium("rad-seeds", "radicle", "--rid", "rad:zTEST")
+    assert "not the same as having no seeds" in str(e.value)
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT replicas FROM media").fetchone()[0] == 2, \
+            "the earlier count must survive a failed refresh"
+
+
+def test_the_rid_comes_from_the_repo_when_not_given(rad_medium, monkeypatch,
+                                                    capsys):
+    calls = stub_rad(monkeypatch, ["z6MkA"], rid="rad:zFROMREPO")
+    rad_medium("rad-seeds", "radicle")
+    assert ("inspect", "--rid") in calls
+    assert "rad:zFROMREPO" in capsys.readouterr().out
+
+
+def test_routing_lines_for_other_repos_are_not_counted(rad_medium, db,
+                                                       monkeypatch, capsys):
+    def fake(*args, home=None):
+        if args[:2] == ("node", "status") and "--only" in args:
+            return 0, MY_NID
+        if args[:2] == ("node", "status"):
+            return 0, "✓ Node is running"
+        if args[:2] == ("node", "routing"):
+            return 0, ("\n".join([
+                json.dumps({"rid": "rad:zTEST", "nid": "z6MkA"}),
+                json.dumps({"rid": "rad:zOTHER", "nid": "z6MkB"}),
+                "not json at all",
+            ]) + "\n")
+        return 0, ""
+
+    monkeypatch.setattr(holdings, "rad", fake)
+    rad_medium("rad-seeds", "radicle", "--rid", "rad:zTEST")
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT replicas FROM media").fetchone()[0] == 1
+
+
+def test_rad_seeds_json(rad_medium, monkeypatch, capsys):
+    stub_rad(monkeypatch, ["z6MkA", "z6MkB", "z6MkC"])
+    rad_medium("rad-seeds", "radicle", "--rid", "rad:zTEST", "--json")
+    doc = json.loads(capsys.readouterr().out)
+    assert doc == {"medium_id": "radicle", "rid": "rad:zTEST", "seeds": 3}
+
+
+def test_a_missing_rad_binary_says_so(rad_medium, monkeypatch):
+    def missing(*args, **kw):
+        raise FileNotFoundError("rad")
+
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", missing)
+    with pytest.raises(SystemExit) as e:
+        rad_medium("rad-seeds", "radicle", "--rid", "rad:zTEST")
+    assert "not on PATH" in str(e.value)
