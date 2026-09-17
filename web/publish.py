@@ -56,8 +56,12 @@ def find_swarmlite_js(explicit: str | None) -> Path:
              " or `npm install swarmlite` here.")
 
 
-IMPORT_RE = re.compile(r"""(?:^|\s)(?:import|export)\b[^;\n]*?"""
-                       r"""from\s+['"](\.[^'"]+)['"]""", re.M)
+# `[^;]` and DOTALL on purpose: a multi-line `import { a, b } from './x.js'`
+# is the commonest shape there is, and an earlier newline-excluding version
+# of this silently matched none of them -- so the check passed while the
+# assembled site was missing a module.
+IMPORT_RE = re.compile(r"""(?:^|\s)(?:import|export)\b[^;]*?"""
+                       r"""\bfrom\s+['"](\.[^'"]+)['"]""", re.M | re.S)
 
 
 def strip_comments(js: str) -> str:
@@ -97,7 +101,8 @@ def copy_page(site: Path, js: Path) -> None:
     """
     site.mkdir(parents=True, exist_ok=True)
     shutil.copy(WEB / "index.html", site / "index.html")
-    shutil.copy(WEB / "app.js", site / "app.js")
+    for name in ("app.js", "view.js"):
+        shutil.copy(WEB / name, site / name)
 
     # Regenerated rather than copied, so a site can never be served or
     # published with SQL the CLI has moved on from. (A test guards the

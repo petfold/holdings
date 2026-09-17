@@ -485,6 +485,18 @@ There is no write path in the page at all: `add-medium`, `scan` and
 `import-restic` do not exist there, and the publisher does not ship
 swarmlite's JS writer alongside the reader.
 
+The logic behind the page lives in `web/view.js` and is tested separately:
+
+```bash
+node --test web/test/view.test.mjs      # no dependencies, no browser
+```
+
+That covers escaping, formatting, the durability tag, table building, the
+query serialiser and URL resolution. It does **not** cover layout — the
+media table clipping at phone width was a real bug and only a browser
+computes layout — so a change to the CSS or the DOM wiring still wants a
+look in one. `python web/serve.py` is enough for that.
+
 ### Offline, on this machine
 
 A published catalog is fetched page by page *at query time*, so it needs
