@@ -1,7 +1,8 @@
 # Publishing a catalog
 
 How to put a catalog somewhere other devices can query it, and how to keep
-it there. Entirely optional: a local catalog, or one in a synced folder, is
+it there. The tutorial is the [User Guide](USER_GUIDE.md); definitions are
+in the [Reference](REFERENCE.md). Entirely optional: a local catalog, or one in a synced folder, is
 the default and needs none of this.
 
 The point is reach without uptime overlap. A synced folder needs the writing
@@ -132,9 +133,10 @@ See the README's *browser viewer* section for what it costs to read.
 
 ## What publishing does not give you
 
-- **Not a write path.** Published catalogs are read-only; `add-medium`,
-  `scan` and `import-restic` refuse a URL. Placement is written where the
-  scanning happens.
+- **Not a write path.** Published catalogs are read-only. Every write
+  command — `add-medium`, `scan`, and all the importers — refuses a URL and
+  points back at the local file. Placement is written where the scanning
+  happens.
 - **Not offline reads.** A reader fetches pages over the network at query
   time. A synced file works on a plane; a published one does not.
 - **Not a backup of the catalog.** Readers hold no copy — a `whereis`

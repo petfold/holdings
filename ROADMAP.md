@@ -8,6 +8,10 @@ The design contract this all sits under is in the
 authority, everything regenerable by re-scanning, content hash is identity,
 single writer and many readers. Nothing here overrides it.
 
+For using the thing rather than planning it: [User
+Guide](docs/USER_GUIDE.md), [Reference](docs/REFERENCE.md),
+[Publishing](docs/PUBLISHING.md).
+
 One clarification that shapes several items below: **how the catalog file
 travels is not part of the contract.** A synced folder and a published
 read-only copy are both valid, neither is required, and the local file is
@@ -394,6 +398,21 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
       site that was missing a module. Fixed, and it then caught the very
       omission that exposed it.
 
+- [x] **A documentation set** (DONE 2026-09-17), before publishing 0.2.0.
+      A User Guide that follows the order someone needs things in, a
+      Reference that lists every command, flag, durability class, evidence
+      level, listing format and table, and a README cut from 574 lines to a
+      front page that points at both.
+
+      The Reference is pinned by `tests/test_reference.py`: a flag added
+      without documenting it fails the suite, and so does a flag documented
+      after being removed. A second test resolves every internal link and
+      anchor across the six documents. Writing the pin found two bugs in
+      itself first — a section that swallowed every heading after it, and a
+      universal flag documented once but demanded per command.
+
+      Every User Guide example was run before being written down.
+
 ## Future — the browser
 
 Not scheduled; recorded so it is not re-derived later. OntoDAG is intended
@@ -417,10 +436,14 @@ agreeing at the meet point (ontodag `docs/plans/PROJECTIONS.md`), not here.
 From the README's "Notes & limits", separated by whether they are meant to
 change:
 
-- [ ] **`import-restic` matching is approximate** — listing entries are
-      matched by basename+size and only when unique; ambiguous ones are
-      recorded as `unverified:` placeholders. Exact hashes already work via
-      scanning a `restic mount`, so the fix is a first-class restic reader.
+- [x] **Listing matching is approximate** (ADDRESSED 2026-09-17, not as
+      written). The fix was not a first-class restic reader: it was making
+      the importer generic, so a source that *can* produce a SHA-256 gives
+      exact placement (`rclone --hash`, `sha256sum` over ssh, git's object
+      store, a Swarm manifest's reference). restic itself still exposes no
+      content hash, so a restic listing remains name+size — `restic mount`
+      plus `scan` is still the exact route there, and the report now says
+      which of the three kinds of claim each entry rests on.
 - **Symlinks are skipped** — by design, not roadmap.
 - **Single-writer** — by design (the contract above), not roadmap.
 - **Hidden config and caches excluded by default** — by design; `--exclude-file`
