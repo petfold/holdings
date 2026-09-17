@@ -68,3 +68,41 @@ def test_no_read_query_writes():
     for name, sql in holdings.QUERIES.items():
         upper = sql.upper()
         assert not any(w in upper for w in forbidden), f"{name} is not read-only"
+
+
+def test_every_internal_documentation_link_resolves():
+    """Four documents that cross-reference each other rot quietly: a moved
+    heading breaks an anchor and nothing says so."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    docs = [*root.glob("*.md"), *root.glob("docs/*.md"),
+            *root.glob("web/test/*.md")]
+    assert len(docs) >= 5, "documents went missing"
+
+    def anchors(text):
+        return {re.sub(r"[^a-z0-9 -]", "", h.lower()).replace(" ", "-")
+                for h in re.findall(r"^#+ (.+)$", text, re.M)}
+
+    broken = []
+    for f in docs:
+        for _, target in re.findall(r"\[([^\]]+)\]\(([^)]+)\)", f.read_text()):
+            if target.startswith(("http://", "https://", "mailto:")):
+                continue
+            path, _, frag = target.partition("#")
+            dest = (f.parent / path) if path else f
+            if not dest.exists():
+                broken.append(f"{f.name}: no such file {target}")
+            elif frag and frag not in anchors(dest.read_text()):
+                broken.append(f"{f.name}: no such anchor {target}")
+    assert not broken, broken
+
+
+def test_the_readme_points_at_the_guides():
+    """The README is the PyPI page; it has to lead somewhere."""
+    from pathlib import Path
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    for doc in ("docs/USER_GUIDE.md", "docs/REFERENCE.md",
+                "docs/PUBLISHING.md", "ROADMAP.md"):
+        assert doc in readme, f"README does not link {doc}"
