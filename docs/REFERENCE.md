@@ -9,7 +9,7 @@ Definition-first, no narrative. The tutorial is the
 fails. Column lists and defaults are not pinned — check them against
 `holdings.py` if a detail matters.
 
-Describes version `0.2.0`.
+Describes version `0.2.1`.
 
 ---
 
