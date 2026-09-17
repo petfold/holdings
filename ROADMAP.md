@@ -24,7 +24,12 @@ Goal: answer "which media hold which files?" from a single stdlib-only script.
       `import-restic`, `whereis`, `redundancy`, `diff`, `only-on`, `stats`,
       `project-ontodag`.
 - [x] Rescan is cheap: unchanged files recognised by size+mtime, not rehashed.
-- [x] Packaged and published as `holdings` 0.1.0 (DONE 2026-09-10).
+- [x] Packaged and published as `holdings` 0.1.0 (DONE 2026-09-10);
+      0.2.0 prepared 2026-09-17 — the CLI grew durability classes, sites,
+      verification, `--json`/`--exit-code`, and readers for Swarm, git
+      remotes, Syncthing and Radicle. The wheel is still the single module:
+      `web/` is repo-only, because the viewer needs swarmlite's JavaScript,
+      which is not a Python dependency.
 - [x] `ontodag_ingest.py` as an adaptation template for the projection
       contract (DONE 2026-09).
 

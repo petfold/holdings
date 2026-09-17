@@ -24,6 +24,10 @@ belong to OntoDAG (see *Projection contract* below).
 
 ## Quick start
 
+`pip install holdings` puts a `holdings` command on your path; the examples
+below use `./holdings.py` because they are written from a checkout. The two
+are the same program.
+
 ```bash
 export HOLDINGS_DB=~/Sync/catalog/catalog.sqlite   # put it in a synced folder
 
@@ -456,7 +460,12 @@ removes that. Fine locally, expensive over a network.
 
 `web/` is a read-only viewer for a published catalog: media, `whereis`,
 `redundancy` and `only-on` in a page with no server, no install and no
-account. It is the same lazy-page trick as the CLI's Swarm reader, in
+account.
+
+It lives in the repository rather than the wheel — `pip install holdings`
+gives you the CLI, and `web/publish.py` and `web/serve.py` need a checkout,
+because they also need swarmlite's JavaScript, which is not a Python
+dependency. Clone the repo to use them. It is the same lazy-page trick as the CLI's Swarm reader, in
 SQLite-WASM — so opening it does not download the catalog.
 
 ```bash
