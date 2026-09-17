@@ -367,6 +367,28 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
       I dig out of the safe next?" is a question worth being able to ask
       from a phone.
 
+- [x] **Cover the viewer's logic** (DONE 2026-09-17). Two real bugs in it
+      were caught only by driving a browser by hand, which is not a process.
+      `web/view.js` now holds the logic — escaping, formatting, the
+      durability tag, table building, the query serialiser, URL resolution —
+      and `node --test web/test/view.test.mjs` covers it with no
+      dependencies, no DOM and no network. A separate CI job runs it, so the
+      Python suite's "no node" property stays true.
+
+      Stated rather than papered over: **layout is not covered and cannot
+      be** by anything short of a browser. The media table clipping at phone
+      width was found by measuring in one, and no stub computes layout. Nor
+      is the wasm engine's behaviour covered — the concurrency bug came from
+      how `wa-sqlite` really behaves; the tests pin the rule that came out of
+      it, not the engine. `web/test/README.md` says so where someone adding
+      a test will read it.
+
+      Extracting the logic found a third bug, in the guard meant to catch
+      this class of thing: `check_imports` used a newline-excluding pattern,
+      so it matched no multi-line `import { … } from` at all and passed a
+      site that was missing a module. Fixed, and it then caught the very
+      omission that exposed it.
+
 ## Future — the browser
 
 Not scheduled; recorded so it is not re-derived later. OntoDAG is intended
