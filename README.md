@@ -313,11 +313,24 @@ laptop while the hub has it. That is the true state of affairs.
 
 **Radicle** works with the same command, being a git remote. But its
 durability is not GitHub's: no custodian who can close your account, and in
-exchange availability is the sum of whoever volunteers to seed you. The
-quantity that ought to count is **seeds other than your own** — a repo
-seeded only by your node is not a second copy — and holdings cannot see
-that today, so it records one `hosted` copy, which is the honest floor
-rather than the true number.
+exchange availability is the sum of whoever volunteers to seed you. So the
+quantity that counts is **seeds other than your own**:
+
+```bash
+./holdings.py add-medium radicle --kind other --durability hosted --replicas 2
+```
+
+`--replicas 0` means nobody else has it, and holdings stops counting it as a
+backup — a repo seeded only by your node is your node, wearing a different
+name. `media` shows the count (`hosted×2`), and `redundancy` reports a count
+that is zero, undated, or older than `--replica-age` (default 30 days),
+because seeds unseed and nothing writes to the catalog when they do.
+
+A hub with a single custodian leaves `--replicas` unset: the question does
+not arise there, and unset is never read as zero.
+
+Filling the number in from `rad` automatically is not done — see
+[ROADMAP.md](ROADMAP.md).
 
 ### Swarm as a medium
 
@@ -520,7 +533,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **213 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **221 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

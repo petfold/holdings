@@ -2333,3 +2333,125 @@ def test_import_refuses_an_unregistered_medium(run, tmp_path):
     with pytest.raises(SystemExit) as e:
         run("import", "nope", listing(tmp_path, "{}\n"))
     assert "register it first" in str(e.value)
+
+
+# ------------------------------------- hosting nobody else participates in
+
+# Radicle's difference from GitHub: no custodian who can close your account,
+# and in exchange availability is the sum of voluntary seeds. A repo seeded
+# only by your own node is your own node.
+
+@pytest.fixture
+def seeded(run, tmp_path, capsys):
+    laptop = tmp_path / "laptop"
+    write(laptop / "main.rs", "source code")
+    run("add-medium", "laptop", "--kind", "laptop")
+    run("scan", "laptop", str(laptop))
+    listing = tmp_path / "l.jsonl"
+    listing.write_text(json.dumps(
+        {"path": "main.rs", "size": len(b"source code")}) + "\n")
+    capsys.readouterr()
+    return run, str(listing)
+
+
+def test_a_repo_only_you_seed_is_not_a_second_copy(seeded, db, capsys):
+    run, listing = seeded
+    run("add-medium", "radicle", "--kind", "other", "--durability", "hosted",
+        "--replicas", "0")
+    run("import", "radicle", listing)
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT is_backup FROM media"
+                         " WHERE medium_id='radicle'").fetchone()[0] == 0
+        assert c.execute("SELECT copies, backup_copies FROM content"
+                         ).fetchone() == (2, 0)
+    with pytest.raises(SystemExit):
+        run("redundancy", "--on", "laptop", "--min-copies", "1",
+            "--exit-code")
+    assert "no independent host" in capsys.readouterr().err
+
+
+def test_other_seeds_make_it_a_real_copy(seeded, db, capsys):
+    run, listing = seeded
+    run("add-medium", "radicle", "--kind", "other", "--durability", "hosted",
+        "--replicas", "2")
+    run("import", "radicle", listing)
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT backup_copies FROM content"
+                         ).fetchone()[0] == 1
+    run("redundancy", "--on", "laptop", "--min-copies", "1", "--exit-code")
+
+
+def test_a_hub_with_one_custodian_needs_no_replica_count(seeded, db, capsys):
+    """GitHub is `hosted` and the question does not arise: there is one
+    custodian and it does hold the copy. NULL must not be read as zero."""
+    run, listing = seeded
+    run("add-medium", "github", "--kind", "other", "--durability", "hosted")
+    run("import", "github", listing)
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        replicas, backup = c.execute(
+            "SELECT replicas, is_backup FROM media"
+            " WHERE medium_id='github'").fetchone()
+    assert replicas is None and backup == 1
+    run("redundancy", "--on", "laptop", "--min-copies", "1", "--exit-code")
+
+
+def test_a_stale_seed_count_is_reported(seeded, db, capsys):
+    """Seeds unseed, and nothing writes to the catalog when they do — the
+    same decay a lease has."""
+    run, listing = seeded
+    run("add-medium", "radicle", "--kind", "other", "--durability", "hosted",
+        "--replicas", "3")
+    run("import", "radicle", listing)
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE media SET replicas_checked=?",
+                  (time.time() - 200 * 86400,))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("redundancy", "--min-copies", "1", "--exit-code")
+    assert "counted 200 days ago" in capsys.readouterr().err
+
+
+def test_a_fresh_count_is_quiet(seeded, capsys):
+    run, listing = seeded
+    run("add-medium", "radicle", "--kind", "other", "--durability", "hosted",
+        "--replicas", "3")
+    run("import", "radicle", listing)
+    capsys.readouterr()
+    run("redundancy", "--min-copies", "1", "--exit-code")
+    assert "AT RISK" not in capsys.readouterr().err
+
+
+def test_the_replica_count_survives_re_registering(seeded, db, capsys):
+    run, _ = seeded
+    run("add-medium", "radicle", "--kind", "other", "--durability", "hosted",
+        "--replicas", "4")
+    run("add-medium", "radicle", "--kind", "other", "--durability", "hosted",
+        "--site", "p2p")
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT replicas FROM media"
+                         " WHERE medium_id='radicle'").fetchone()[0] == 4
+
+
+def test_hand_setting_is_backup_against_the_replica_rule_is_drift(
+        seeded, db, capsys):
+    run, _ = seeded
+    run("add-medium", "radicle", "--kind", "other", "--durability", "hosted",
+        "--replicas", "0")
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE media SET is_backup=1 WHERE medium_id='radicle'")
+    with pytest.raises(SystemExit):
+        run("check")
+    assert "disagrees with durability" in capsys.readouterr().err
+
+
+def test_media_shows_the_seed_count(seeded, capsys):
+    run, _ = seeded
+    run("add-medium", "radicle", "--kind", "other", "--durability", "hosted",
+        "--replicas", "2")
+    capsys.readouterr()
+    run("media")
+    assert "hosted×2" in capsys.readouterr().out

@@ -298,12 +298,23 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
         catalog uses, which matters most on Hugging Face where a repo is
         pointers almost all the way down.
 
-        Radicle uses the same command but not the same durability, and this
-        is the part still unmodelled: it has no custodian who can close your
-        account, and in exchange availability is the sum of voluntary seeds.
-        The quantity that should count is **seeds other than your own**;
-        holdings records one `hosted` copy, which is a floor and not the
-        truth. Counting seeds needs `rad`-specific plumbing.
+        Radicle uses the same command but not the same durability, and
+        that half is now modelled: `media.replicas` counts independent
+        hosts *other than your own machine*, `hosted` with `replicas = 0`
+        stops counting as a backup, and a count that is zero, undated or
+        stale is reported like a lapsing lease (DONE 2026-09-17). A hub
+        with one custodian leaves it unset, and unset is never read as
+        zero.
+
+      * [ ] **Read the seed count from `rad`.** The number is settable by
+        hand; nothing fills it in. Deliberately not written blind: `rad`
+        was not installed here, so the parser could not be run against
+        real output — and this is the number that decides whether
+        something counts as a backup, which is the worst possible place to
+        guess. Two interface guesses already went wrong in one sitting
+        (`sha256sum -r` is BSD-only; Syncthing's REST shapes were nearly
+        invented before a live instance was started to read them). Wants
+        `rad sync status` or radicle-httpd against a real node.
 
       * **Sync mirrors as a placement source** — v0.2's Syncthing REST
         adapter feeds `mirror`, and the class is now there to receive it.
