@@ -55,6 +55,12 @@ CREATE TABLE IF NOT EXISTS media (
     site          TEXT,
     lease_expires REAL,                      -- when a leased copy lapses
     lease_checked REAL,                      -- when that estimate was taken
+    -- Independent hosts holding this medium's content, NOT counting your
+    -- own machine. NULL where the question does not arise (one custodian,
+    -- like GitHub). 0 means nobody else has it, which for peer-to-peer
+    -- hosting is the difference between a copy and the same copy.
+    replicas         INTEGER,
+    replicas_checked REAL,
     notes         TEXT,
     last_scanned  REAL,
     file_count      INTEGER NOT NULL DEFAULT 0, -- derived from instances
@@ -202,6 +208,8 @@ def migrate(conn: sqlite3.Connection) -> None:
         ("media", "verified_at", "REAL"),
         ("content", "backup_kinds", "INTEGER NOT NULL DEFAULT 0"),
         ("media", "lease_expires", "REAL"),
+        ("media", "replicas", "INTEGER"),
+        ("media", "replicas_checked", "REAL"),
         ("media", "lease_checked", "REAL"),
         ("media", "sole_backup_count", "INTEGER NOT NULL DEFAULT 0"),
         ("media", "sole_backup_bytes", "INTEGER NOT NULL DEFAULT 0"),
@@ -420,6 +428,10 @@ DURABILITY = {
 # the copy does not exist.
 COUNTS_AS_BACKUP = ("independent", "leased", "hosted")
 
+# How long a replica count may go unrefreshed before it is worth doubting.
+# Seeds come and go; a number recorded last year describes last year.
+DEFAULT_REPLICA_AGE_DAYS = 30.0
+
 # How long a lease must have left before it is treated as a dependable
 # backup copy. A node's TTL is an estimate at the current storage price; if
 # the price rises the batch drains faster than quoted, so the number is an
@@ -503,7 +515,7 @@ QUERIES = {
     "media":
         "SELECT medium_id, kind, is_backup, location_hint, last_scanned,"
         "       file_count, byte_count, only_here_count, only_here_bytes,"
-        "       durability, lease_expires, site, verified_at"
+        "       durability, lease_expires, site, verified_at, replicas"
         " FROM media ORDER BY medium_id",
     "summary":
         "SELECT content_count, content_bytes, instance_count"
@@ -658,6 +670,30 @@ def lease_risks(conn, margin_days: float) -> list[tuple[str, str]]:
     return risks
 
 
+def replica_risks(conn, max_age_days: float) -> list[tuple[str, str]]:
+    """Hosted media whose independent-host count cannot be relied on.
+
+    The same shape as a lease: a fact that was true when it was recorded
+    and decays on its own. Seeds unseed, providers drop content, and
+    nothing writes to the catalog when they do.
+    """
+    now = time.time()
+    risks = []
+    for mid, n, checked in conn.execute(
+            "SELECT medium_id, replicas, replicas_checked FROM media"
+            " WHERE durability='hosted' AND replicas IS NOT NULL"
+            " ORDER BY medium_id"):
+        if n < 1:
+            risks.append((mid, "no independent host -- only your own node"))
+        elif checked is None:
+            risks.append((mid, f"{n} host(s), but nothing says when that was"
+                               f" counted"))
+        elif (now - checked) / 86400 > max_age_days:
+            risks.append((mid, f"{n} host(s), counted"
+                               f" {(now - checked) / 86400:.0f} days ago"))
+    return risks
+
+
 def refresh_derived(conn) -> None:
     """Recompute every derived column from the base tables.
 
@@ -675,7 +711,13 @@ def refresh_derived(conn) -> None:
     # something anyone asserts directly.
     conn.execute(
         "UPDATE media SET is_backup ="
-        f"  CASE WHEN durability IN ({_BACKUP_CLASSES_SQL}) THEN 1 ELSE 0 END")
+        f"  CASE WHEN durability NOT IN ({_BACKUP_CLASSES_SQL}) THEN 0"
+        # Hosting nobody else participates in is your own machine wearing a
+        # different name. A Radicle repo seeded only by your node is not a
+        # second copy of anything.
+        "       WHEN durability = 'hosted' AND replicas IS NOT NULL"
+        "            AND replicas < 1 THEN 0"
+        "       ELSE 1 END")
     # Staged through a temp table rather than UPDATE..FROM, which needs
     # SQLite 3.33 -- newer than `requires-python = ">=3.10"` guarantees.
     conn.execute("DROP TABLE IF EXISTS temp._counts")
@@ -758,9 +800,11 @@ def derived_drift(conn) -> list[str]:
             f"e.g. {wrong[0]!r}")
 
     claimed = conn.execute(
-        "SELECT COUNT(*) FROM media WHERE is_backup <>"
-        f"  (CASE WHEN durability IN ({_BACKUP_CLASSES_SQL}) THEN 1 ELSE 0 END)"
-    ).fetchone()[0]
+        "SELECT COUNT(*) FROM media WHERE is_backup <> (CASE"
+        f"  WHEN durability NOT IN ({_BACKUP_CLASSES_SQL}) THEN 0"
+        "   WHEN durability = 'hosted' AND replicas IS NOT NULL"
+        "        AND replicas < 1 THEN 0"
+        "   ELSE 1 END)").fetchone()[0]
     if claimed:
         problems.append(
             f"media.is_backup disagrees with durability on {claimed} row(s)")
@@ -897,6 +941,8 @@ def cmd_check(conn, args):
     # question a reader is really asking: can I rely on what this says?
     problems += [f"leased medium '{m}': {w}"
                  for m, w in lease_risks(conn, DEFAULT_LEASE_MARGIN_DAYS)]
+    problems += [f"hosted medium '{m}': {w}"
+                 for m, w in replica_risks(conn, DEFAULT_REPLICA_AGE_DAYS)]
     if emit_json(args, {"consistent": not problems, "problems": problems}):
         if problems:
             raise SystemExit(1)
@@ -981,17 +1027,24 @@ def cmd_add_medium(conn, args):
     conn.execute(
         "INSERT OR REPLACE INTO media"
         " (medium_id, kind, location_hint, durability, site, notes,"
-        "  last_scanned, lease_expires, lease_checked)"
+        "  last_scanned, lease_expires, lease_checked,"
+        "  replicas, replicas_checked)"
         " VALUES (?,?,?,?,"
         "   COALESCE(?, (SELECT site FROM media WHERE medium_id=?)),?,"
         "   (SELECT last_scanned FROM media WHERE medium_id=?),"
         "   COALESCE(?, (SELECT lease_expires FROM media WHERE medium_id=?)),"
-        "   COALESCE(?, (SELECT lease_checked FROM media WHERE medium_id=?)))",
+        "   COALESCE(?, (SELECT lease_checked FROM media WHERE medium_id=?)),"
+        "   COALESCE(?, (SELECT replicas FROM media WHERE medium_id=?)),"
+        "   COALESCE(?, (SELECT replicas_checked FROM media"
+        "                 WHERE medium_id=?)))",
         (args.medium_id, args.kind, args.location, durability,
          args.site, args.medium_id, args.notes,
          args.medium_id,
          expires, args.medium_id,
-         time.time() if expires else None, args.medium_id),
+         time.time() if expires else None, args.medium_id,
+         args.replicas, args.medium_id,
+         time.time() if args.replicas is not None else None,
+         args.medium_id),
     )
     refresh_derived(conn)       # the class here changes every backup_copies
     conn.commit()
@@ -1006,7 +1059,8 @@ def cmd_media(conn, args):
     fields = ("medium_id", "kind", "is_backup", "location_hint",
               "last_scanned", "file_count", "byte_count",
               "only_here_count", "only_here_bytes",
-              "durability", "lease_expires", "site", "verified_at")
+              "durability", "lease_expires", "site", "verified_at",
+              "replicas")
     if emit_json(args, {"media": [dict(zip(fields, r)) for r in rows]}):
         return
     if not rows:
@@ -1016,9 +1070,11 @@ def cmd_media(conn, args):
           f" {'FILES':>8} {'SIZE':>10} {'LAST SCAN':19} {'LAST READ':10}"
           f"  LOCATION")
     for (mid, kind, _bk, loc, ts, nfiles, nbytes, _only_n, _only_b,
-         durability, expires, site, verified) in rows:
+         durability, expires, site, verified, replicas) in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "never"
         shown = durability
+        if durability == "hosted" and replicas is not None:
+            shown = f"hosted×{replicas}"
         if durability == "leased" and expires:
             shown = f"{durability}*" if expires <= time.time() else durability
         read = (time.strftime("%Y-%m-%d", time.localtime(verified))
@@ -1901,7 +1957,8 @@ def cmd_redundancy(conn, args):
     # above can be right as of the last scan and wrong now. Checked here,
     # and counted as a violation: a backup you have stopped paying for is
     # not a backup, and this is the report that gates other people's cron.
-    risks = lease_risks(conn, args.lease_margin)
+    risks = (lease_risks(conn, args.lease_margin)
+             + replica_risks(conn, args.replica_age))
 
     cols = ("hash", "size", "backup_copies", "copies", "example_path",
             "backup_sites", "backup_kinds", "backup_verified_at")
@@ -1917,7 +1974,7 @@ def cmd_redundancy(conn, args):
         policy_exit(args, total + len(risks))
         return
     for mid, why in risks:
-        print(f"AT RISK: leased medium '{mid}' -- {why}", file=sys.stderr)
+        print(f"AT RISK: '{mid}' -- {why}", file=sys.stderr)
     def plural(n, word):
         return f"{n} {word}{'' if n == 1 else 's'}"
 
@@ -2098,6 +2155,10 @@ def build_parser():
     s.add_argument("--lease-expires", metavar="WHEN",
                    help="for --durability leased: YYYY-MM-DD, or a duration"
                         " from now such as 30d or 4w")
+    s.add_argument("--replicas", type=int, metavar="N",
+                   help="for --durability hosted: independent hosts holding"
+                        " it, NOT counting your own machine. 0 means nobody"
+                        " else has it, and it stops counting as a backup")
     s.add_argument("--lease-from-batch", metavar="BATCH_ID",
                    help="read the expiry from a postage batch on the node"
                         " rather than typing it (needs holdings[swarm])")
@@ -2211,6 +2272,11 @@ def build_parser():
                         " hash without opening the file, so 'seen' is not"
                         " 'verified' (default 0, unchecked)")
     s.add_argument("--limit", type=int, default=40)
+    s.add_argument("--replica-age", type=float, metavar="DAYS",
+                   default=DEFAULT_REPLICA_AGE_DAYS,
+                   help="a hosted medium whose replica count was taken"
+                        " longer ago than this is reported as at risk"
+                        f" (default {DEFAULT_REPLICA_AGE_DAYS:.0f})")
     s.add_argument("--lease-margin", type=float, metavar="DAYS",
                    default=DEFAULT_LEASE_MARGIN_DAYS,
                    help="a leased medium with less than this left is reported"
