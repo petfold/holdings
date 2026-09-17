@@ -537,6 +537,28 @@ QUERIES = {
         " WHERE backup_copies < ? OR backup_sites < ? OR backup_kinds < ?"
         "    OR (? > 0 AND COALESCE(backup_verified_at, 0) < ?)"
         " ORDER BY backup_copies, size DESC LIMIT ?",
+    # The same question restricted to one medium: "is everything HERE
+    # backed up?" -- which is what you ask before reformatting a laptop or
+    # wiping a drive. Proportional to that medium, like `diff`, because it
+    # walks its rows; that is fine for a decision made while sitting in
+    # front of the thing.
+    "scoped_rows":
+        "SELECT DISTINCT c.hash, c.size, c.backup_copies, c.copies,"
+        "       c.example_path, c.backup_sites, c.backup_kinds,"
+        "       c.backup_verified_at"
+        "  FROM content c JOIN instances i ON i.hash = c.hash"
+        " WHERE i.medium_id = ?"
+        "   AND (c.backup_copies < ? OR c.backup_sites < ?"
+        "        OR c.backup_kinds < ?"
+        "        OR (? > 0 AND COALESCE(c.backup_verified_at, 0) < ?))"
+        " ORDER BY c.backup_copies, c.size DESC LIMIT ?",
+    "scoped_total":
+        "SELECT COUNT(DISTINCT c.hash) AS n"
+        "  FROM content c JOIN instances i ON i.hash = c.hash"
+        " WHERE i.medium_id = ?"
+        "   AND (c.backup_copies < ? OR c.backup_sites < ?"
+        "        OR c.backup_kinds < ?"
+        "        OR (? > 0 AND COALESCE(c.backup_verified_at, 0) < ?))",
     "policy_total":
         "SELECT COUNT(*) AS n FROM content"
         " WHERE backup_copies < ? OR backup_sites < ? OR backup_kinds < ?"
@@ -1462,9 +1484,22 @@ def cmd_redundancy(conn, args):
     # The default question -- "fewer than N backup copies" -- stays on the
     # index. Asking the full 3-2-1 question costs a scan, so it happens only
     # when the extra thresholds are actually set.
+    if args.on:
+        known = conn.execute("SELECT 1 FROM media WHERE medium_id=?",
+                             (args.on,)).fetchone()
+        if not known:
+            sys.exit(f"unknown medium '{args.on}'")
     full = (args.min_sites > 1 or args.min_kinds > 1
             or args.verified_within > 0)
-    if full:
+    if args.on:
+        cutoff = (time.time() - args.verified_within * 86400
+                  if args.verified_within > 0 else 0)
+        params = (args.on, args.min_copies, args.min_sites, args.min_kinds,
+                  args.verified_within, cutoff)
+        rows = conn.execute(QUERIES["scoped_rows"],
+                            params + (args.limit,)).fetchall()
+        total = conn.execute(QUERIES["scoped_total"], params).fetchone()[0]
+    elif full:
         # 0 disables the clause entirely; otherwise anything whose newest
         # backup verification is older than the cutoff (or absent) counts.
         cutoff = (time.time() - args.verified_within * 86400
@@ -1489,6 +1524,7 @@ def cmd_redundancy(conn, args):
             "backup_sites", "backup_kinds", "backup_verified_at")
     if emit_json(args, {
             "min_copies": args.min_copies,
+            "on": args.on,
             "min_sites": args.min_sites,
             "min_kinds": args.min_kinds,
             "below": total,
@@ -1503,25 +1539,26 @@ def cmd_redundancy(conn, args):
         return f"{n} {word}{'' if n == 1 else 's'}"
 
     policy = plural(args.min_copies, "backup copy").replace("copys", "copies")
+    scope = f" on '{args.on}'" if args.on else ""
     if full:
         policy += (f", {plural(args.min_sites, 'site')}"
                    f", {plural(args.min_kinds, 'kind')}")
         if args.verified_within > 0:
             policy += f", read within {args.verified_within:.0f}d"
     if not rows:
-        print(f"OK: everything meets {policy}.")
+        print(f"OK: everything{scope} meets {policy}.")
         policy_exit(args, total + len(risks))
         return
-    print(f"{total} content objects below {policy}"
+    print(f"{total} content objects{scope} below {policy}"
           f" (showing up to {args.limit}, largest first):")
     head = f"{'BK':>2} {'ALL':>3}"
-    if full:
+    if full and rows and len(rows[0]) > 7:
         head += f" {'SITE':>4} {'KIND':>4} {'READ':>10}"
     print(f"{head} {'SIZE':>10}  EXAMPLE PATH")
     for row in rows:
         h, size, bcopies, copies, path = row[:5]
         extra = ""
-        if full:
+        if full and len(row) > 7:
             when = (time.strftime("%Y-%m-%d", time.localtime(row[7]))
                     if row[7] else "never")
             extra = f" {row[5]:>4} {row[6]:>4} {when:>10}"
@@ -1740,6 +1777,10 @@ def build_parser():
 
     s = reads("redundancy", help="content below N backup copies")
     s.add_argument("--min-copies", type=int, default=2)
+    s.add_argument("--on", metavar="MEDIUM",
+                   help="only content present on this medium -- 'is"
+                        " everything HERE backed up?', which is the question"
+                        " before reformatting or wiping it")
     s.add_argument("--min-sites", type=int, default=1, metavar="N",
                    help="the '1 offsite' of 3-2-1: require backup copies at"
                         " N distinct sites (default 1, i.e. unchecked)")

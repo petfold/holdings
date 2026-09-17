@@ -80,9 +80,27 @@ holdings only-on drive-old --exit-code || wipe-it
 ```
 
 `redundancy` turns your 3-2-1 policy into a checkable report.
-`only-on` is the consolidation to-do list for old scattered drives: run it,
-back those files up via restic, rescan, watch the list empty, then wipe the
-drive with confidence.
+`only-on` is the consolidation to-do list for old scattered drives: content
+that exists on one medium and nowhere else at all.
+
+### Before you wipe something
+
+"Is everything on this laptop backed up?" is **not** what `only-on` answers,
+and the difference can bite. `only-on` asks *does anything else hold this?* —
+and a sync mirror answers yes, while being exactly the copy that does not
+survive. A file on your laptop and in Dropbox is not `only-on` the laptop,
+and has no backup at all.
+
+Ask about backups instead, scoped to the medium you are about to destroy:
+
+```bash
+./holdings.py redundancy --on laptop-x1 --min-copies 1 --exit-code || echo "not yet"
+```
+
+That is the reformat gate: it counts only copies that survive deleting the
+original, and it ignores everything not on that medium, so an unbacked file
+on some other drive does not block you. Raise `--min-copies` if one backup
+is not enough to bet on.
 
 ## What counts as a backup copy
 
@@ -396,7 +414,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **168 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **175 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.
