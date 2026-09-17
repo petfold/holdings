@@ -84,6 +84,27 @@ CREATE TABLE IF NOT EXISTS backup_histogram (
     content_count INTEGER NOT NULL
 );
 
+-- Human categories, composed by OntoDAG on the writing machine and
+-- materialised here so a reader can join them to placement without a
+-- lattice. Opt-in: a catalog only has these if someone imported them.
+--
+-- The direction matters. holdings does not compute categories and never
+-- will -- semantics belong to OntoDAG. This is the same move as every
+-- other derived column here: materialise at write time what a reader
+-- would otherwise have to compute, and record what it was built from so
+-- staleness is detectable (PROJECTIONS.md §3, amended 2026-09-17).
+CREATE TABLE IF NOT EXISTS categories (
+    hash     TEXT NOT NULL REFERENCES content(hash),
+    category TEXT NOT NULL,
+    PRIMARY KEY (hash, category)
+);
+
+CREATE TABLE IF NOT EXISTS category_source (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    source_key  TEXT,                -- what the memberships were built from
+    imported_at REAL
+);
+
 -- One row (id=1) of totals that `stats` would otherwise scan the whole
 -- catalog to produce.
 CREATE TABLE IF NOT EXISTS catalog_summary (
@@ -171,6 +192,9 @@ CREATE INDEX IF NOT EXISTS idx_content_redundancy
 -- whole medium, which measured at minutes over a network.
 CREATE INDEX IF NOT EXISTS idx_content_singletons
     ON content(copies, size DESC);
+-- "Which Vienna photos are unbacked?" walks one category, not the catalog.
+CREATE INDEX IF NOT EXISTS idx_categories_category
+    ON categories(category, hash);
 -- `only-on` wants one medium's singletons, largest first. Carrying the
 -- flag on the instance row lets one index range scan answer that, instead
 -- of walking every singleton in the catalog and probing for its medium.
@@ -554,6 +578,23 @@ QUERIES = {
     # wiping a drive. Proportional to that medium, like `diff`, because it
     # walks its rows; that is fine for a decision made while sitting in
     # front of the thing.
+    "category_rows":
+        "SELECT DISTINCT c.hash, c.size, c.backup_copies, c.copies,"
+        "       c.example_path, c.backup_sites, c.backup_kinds,"
+        "       c.backup_verified_at"
+        "  FROM content c JOIN categories k ON k.hash = c.hash"
+        " WHERE k.category = ?"
+        "   AND (c.backup_copies < ? OR c.backup_sites < ?"
+        "        OR c.backup_kinds < ?"
+        "        OR (? > 0 AND COALESCE(c.backup_verified_at, 0) < ?))"
+        " ORDER BY c.backup_copies, c.size DESC LIMIT ?",
+    "category_total":
+        "SELECT COUNT(DISTINCT c.hash) AS n"
+        "  FROM content c JOIN categories k ON k.hash = c.hash"
+        " WHERE k.category = ?"
+        "   AND (c.backup_copies < ? OR c.backup_sites < ?"
+        "        OR c.backup_kinds < ?"
+        "        OR (? > 0 AND COALESCE(c.backup_verified_at, 0) < ?))",
     "scoped_rows":
         "SELECT DISTINCT c.hash, c.size, c.backup_copies, c.copies,"
         "       c.example_path, c.backup_sites, c.backup_kinds,"
@@ -591,6 +632,13 @@ QUERIES = {
         "  FROM media WHERE durability <> 'working'"
         " ORDER BY sole_backup_count > 0 DESC,"
         "          verified_at IS NULL DESC, verified_at ASC",
+    # The join OntoDAG exists for, from the reader's side: one category,
+    # then the placement facts already materialised on `content`.
+    "categories":
+        "SELECT category, COUNT(*) AS n FROM categories"
+        " GROUP BY category ORDER BY category",
+    "category_source":
+        "SELECT source_key, imported_at FROM category_source WHERE id=1",
     "newest_scan":
         "SELECT MAX(last_scanned) AS newest FROM media",
 }
@@ -2030,7 +2078,15 @@ def cmd_redundancy(conn, args):
             sys.exit(f"unknown medium '{args.on}'")
     full = (args.min_sites > 1 or args.min_kinds > 1
             or args.verified_within > 0)
-    if args.on:
+    if args.category:
+        cutoff = (time.time() - args.verified_within * 86400
+                  if args.verified_within > 0 else 0)
+        params = (args.category, args.min_copies, args.min_sites,
+                  args.min_kinds, args.verified_within, cutoff)
+        rows = conn.execute(QUERIES["category_rows"],
+                            params + (args.limit,)).fetchall()
+        total = conn.execute(QUERIES["category_total"], params).fetchone()[0]
+    elif args.on:
         cutoff = (time.time() - args.verified_within * 86400
                   if args.verified_within > 0 else 0)
         params = (args.on, args.min_copies, args.min_sites, args.min_kinds,
@@ -2065,6 +2121,7 @@ def cmd_redundancy(conn, args):
     if emit_json(args, {
             "min_copies": args.min_copies,
             "on": args.on,
+            "category": args.category,
             "min_sites": args.min_sites,
             "min_kinds": args.min_kinds,
             "below": total,
@@ -2079,7 +2136,8 @@ def cmd_redundancy(conn, args):
         return f"{n} {word}{'' if n == 1 else 's'}"
 
     policy = plural(args.min_copies, "backup copy").replace("copys", "copies")
-    scope = f" on '{args.on}'" if args.on else ""
+    scope = (f" in '{args.category}'" if args.category
+             else f" on '{args.on}'" if args.on else "")
     if full:
         policy += (f", {plural(args.min_sites, 'site')}"
                    f", {plural(args.min_kinds, 'kind')}")
@@ -2164,6 +2222,81 @@ def cmd_stats(conn, args):
     print(f"media: {n_media}   unique content: {n_content}"
           f" ({human_size(t_bytes)})   instances: {n_inst}"
           f"   (dedup would fold {dup} duplicate placements)")
+
+
+def cmd_import_categories(conn, args):
+    """Materialise human categories, composed elsewhere, against placement.
+
+    The other half of the OntoDAG join, and the direction that makes it
+    answerable from a phone. `project-ontodag` sends placement *out*, to be
+    ingested as a regenerable `sys:` layer. This brings composed memberships
+    *in*, so a published catalog can answer "which Vienna photos are
+    unbacked?" as an index lookup rather than by shipping a lattice to the
+    reader.
+
+    holdings does not compute categories and never will -- semantics belong
+    to OntoDAG. It reads a listing, the way it reads every other source:
+
+        {"item": "sha256:...", "categories": ["vienna", "photo"]}
+
+    which `odag` produces from the composed view. Full rebuild, not
+    diffing: the table is dropped and rewritten, because staleness is a
+    permitted failure mode here and drift is not.
+
+    `--source-key` records what the memberships were composed from, so a
+    reader can tell whether they still describe this catalog -- the
+    condition the projection contract gained when it stopped requiring
+    derived data to stay on one machine.
+    """
+    started = time.time()
+    with open_listing(args.listing) as stream:
+        entries = [json.loads(line) for line in stream if line.strip()]
+
+    conn.execute("DELETE FROM categories")
+    known = {h for h, in conn.execute("SELECT hash FROM content")}
+    pairs, unknown = [], 0
+    for e in entries:
+        item = e.get("item")
+        if not item:
+            continue
+        if item not in known:
+            # A category for content this catalog has never seen is not
+            # evidence of anything; recorded silently it would inflate
+            # every count that joins on it.
+            unknown += 1
+            continue
+        for cat in e.get("categories") or ():
+            pairs.append((item, str(cat)))
+    conn.executemany("INSERT OR IGNORE INTO categories (hash, category)"
+                     " VALUES (?,?)", pairs)
+    # Same reason refresh_derived does: without statistics the planner
+    # drives this join from `content` and scans it, when walking one
+    # category and probing by hash is the whole point of the table.
+    conn.execute("ANALYZE")
+    conn.execute(
+        "INSERT INTO category_source (id, source_key, imported_at)"
+        " VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET"
+        "   source_key=excluded.source_key, imported_at=excluded.imported_at",
+        (args.source_key, started))
+    conn.commit()
+
+    cats = conn.execute("SELECT COUNT(DISTINCT category) FROM categories"
+                        ).fetchone()[0]
+    if emit_json(args, {"items": len({h for h, _ in pairs}),
+                        "memberships": len(pairs), "categories": cats,
+                        "unknown_items": unknown,
+                        "source_key": args.source_key}):
+        return
+    print(f"imported {len(pairs)} membership(s) over {cats} categories"
+          f" for {len({h for h, _ in pairs})} content objects")
+    if unknown:
+        print(f"note: {unknown} item(s) are not in this catalog and were"
+              f" skipped -- scan the media holding them first.",
+              file=sys.stderr)
+    if not args.source_key:
+        print("note: no --source-key recorded. A reader cannot then tell"
+              " whether these memberships still describe this catalog.",
+              file=sys.stderr)
 
 
 def cmd_project_ontodag(conn, args):
@@ -2363,6 +2496,9 @@ def build_parser():
 
     s = reads("redundancy", help="content below N backup copies")
     s.add_argument("--min-copies", type=int, default=2)
+    s.add_argument("--category", metavar="NAME",
+                   help="only content in this OntoDAG category (needs"
+                        " import-categories)")
     s.add_argument("--on", metavar="MEDIUM",
                    help="only content present on this medium -- 'is"
                         " everything HERE backed up?', which is the question"
@@ -2420,6 +2556,17 @@ def build_parser():
     s.add_argument("--exit-code", action="store_true",
                    help="exit 1 when any medium is overdue")
     s.set_defaults(func=cmd_due, writes=False)
+
+    s = sub.add_parser("import-categories",
+                       help="materialise OntoDAG categories against"
+                            " placement (prototype)")
+    s.add_argument("listing", nargs="?", default="-",
+                   help="JSON lines of {item, categories} ('-' = stdin)")
+    s.add_argument("--source-key", metavar="KEY",
+                   help="what the memberships were composed from, so"
+                        " staleness is detectable")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_import_categories, writes=True)
 
     s = reads("check",
                        help="verify derived columns against the base tables")

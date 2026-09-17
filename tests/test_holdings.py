@@ -620,7 +620,7 @@ def test_the_commands_that_write_are_the_ones_that_change_placement():
     writers = {n for n, sp in subs.choices.items() if sp.get_default("writes")}
     assert writers == {"add-medium", "scan", "import", "import-restic",
                        "import-swarm", "import-git", "import-syncthing",
-                       "check-swarm", "rad-seeds"}
+                       "check-swarm", "rad-seeds", "import-categories"}
 
 
 @pytest.mark.parametrize("argv", [
@@ -2590,3 +2590,143 @@ def test_a_missing_rad_binary_says_so(rad_medium, monkeypatch):
     with pytest.raises(SystemExit) as e:
         rad_medium("rad-seeds", "radicle", "--rid", "rad:zTEST")
     assert "not on PATH" in str(e.value)
+
+
+# ------------------------------------------- categories joined to placement
+
+# The question the two systems exist to answer together: "which Vienna
+# photos are unbacked?" The categories are composed by OntoDAG on the
+# writing machine and materialised here, so a reader joins them to placement
+# without a lattice — ontodag PROJECTIONS.md §3, amended 2026-09-17.
+
+@pytest.fixture
+def with_categories(run, db, tmp_path, capsys):
+    laptop, drive = tmp_path / "laptop", tmp_path / "drive"
+    write(laptop / "photos/stephansdom.jpg", "vienna cathedral")
+    write(laptop / "photos/graben.jpg", "vienna street")
+    write(laptop / "taxes.pdf", "tax form")
+    write(drive / "stephansdom.jpg", "vienna cathedral")
+    run("add-medium", "laptop", "--kind", "laptop")
+    run("add-medium", "drive", "--kind", "drive", "--durability",
+        "independent")
+    run("scan", "laptop", str(laptop))
+    run("scan", "drive", str(drive))
+    capsys.readouterr()
+
+    with sqlite3.connect(db) as c:
+        by_path = dict(c.execute("SELECT example_path, hash FROM content"))
+
+    def load(entries, *extra):
+        f = tmp_path / "cats.jsonl"
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        run("import-categories", str(f), *extra)
+        capsys.readouterr()
+
+    return run, by_path, load
+
+
+def test_the_join_answers_which_vienna_photos_are_unbacked(with_categories,
+                                                           capsys):
+    run, by_path, load = with_categories
+    load([
+        {"item": by_path["photos/stephansdom.jpg"],
+         "categories": ["vienna", "photo"]},
+        {"item": by_path["photos/graben.jpg"], "categories": ["vienna"]},
+        {"item": by_path["taxes.pdf"], "categories": ["admin"]},
+    ], "--source-key", "odag-abc")
+
+    run("redundancy", "--category", "vienna", "--min-copies", "1")
+    out = capsys.readouterr().out
+    assert "graben.jpg" in out                  # vienna, no backup
+    assert "stephansdom.jpg" not in out         # vienna, on the drive
+    assert "taxes.pdf" not in out               # unbacked, but not vienna
+    assert "in 'vienna'" in out
+
+
+def test_a_category_nobody_used_is_simply_empty(with_categories, capsys):
+    run, by_path, load = with_categories
+    load([{"item": by_path["taxes.pdf"], "categories": ["admin"]}])
+    run("redundancy", "--category", "nosuch", "--min-copies", "1")
+    assert "OK" in capsys.readouterr().out
+
+
+def test_categories_for_unknown_content_are_skipped_not_invented(
+        with_categories, db, capsys):
+    """A category for content this catalog has never seen is not evidence of
+    anything; recorded silently it would inflate every count joining on it."""
+    run, by_path, load = with_categories
+    f = Path(str(db)).parent / "c.jsonl"
+    f.write_text("\n".join(json.dumps(e) for e in [
+        {"item": by_path["taxes.pdf"], "categories": ["admin"]},
+        {"item": "sha256:" + "0" * 64, "categories": ["vienna"]},
+    ]) + "\n")
+    run("import-categories", str(f))
+    err = capsys.readouterr().err
+    assert "1 item(s) are not in this catalog" in err
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT COUNT(*) FROM categories").fetchone()[0] == 1
+
+
+def test_importing_is_a_full_rebuild_not_a_merge(with_categories, db):
+    """Staleness is permitted here; drift is not."""
+    run, by_path, load = with_categories
+    load([{"item": by_path["taxes.pdf"], "categories": ["admin", "old"]}])
+    load([{"item": by_path["taxes.pdf"], "categories": ["admin"]}])
+    with sqlite3.connect(db) as c:
+        cats = {k for k, in c.execute("SELECT category FROM categories")}
+    assert cats == {"admin"}, "a dropped category must not survive"
+
+
+def test_the_source_key_is_recorded(with_categories, db):
+    run, by_path, load = with_categories
+    load([{"item": by_path["taxes.pdf"], "categories": ["admin"]}],
+         "--source-key", "odag-root-abc123")
+    with sqlite3.connect(db) as c:
+        key, when = c.execute(
+            "SELECT source_key, imported_at FROM category_source").fetchone()
+    assert key == "odag-root-abc123" and when
+
+
+def test_omitting_the_source_key_is_called_out(with_categories, db,
+                                              capsys):
+    """Without it a reader cannot tell whether these memberships still
+    describe this catalog — the condition the contract gained when it
+    stopped requiring derived data to stay on one machine."""
+    run, by_path, _ = with_categories
+    f = Path(db).parent / "nokey.jsonl"
+    f.write_text(json.dumps(
+        {"item": by_path["taxes.pdf"], "categories": ["admin"]}) + "\n")
+
+    run("import-categories", str(f))
+    assert "no --source-key recorded" in capsys.readouterr().err
+
+    run("import-categories", str(f), "--source-key", "k")
+    assert "no --source-key recorded" not in capsys.readouterr().err
+
+
+def test_categories_survive_a_rescan(with_categories, db, tmp_path, capsys):
+    """Placement is rebuilt constantly; the imported memberships must not be
+    collateral damage."""
+    run, by_path, load = with_categories
+    load([{"item": by_path["taxes.pdf"], "categories": ["admin"]}])
+    run("scan", "laptop", str(tmp_path / "laptop"))
+    capsys.readouterr()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT COUNT(*) FROM categories").fetchone()[0] == 1
+
+
+def test_the_category_join_uses_the_index(with_categories, db):
+    """Cost proportional to the category, not the catalog — which is the
+    whole reason to materialise rather than ship a lattice to the reader."""
+    run, by_path, load = with_categories
+    entries = [{"item": h, "categories": [f"c{i % 30}"]}
+               for i, h in enumerate(by_path.values())]
+    entries.append({"item": by_path["photos/graben.jpg"],
+                    "categories": ["vienna"]})
+    load(entries)
+    with sqlite3.connect(db) as c:
+        c.execute("ANALYZE")
+        plan = [r[-1] for r in c.execute(
+            "EXPLAIN QUERY PLAN " + holdings.QUERIES["category_rows"],
+            ("vienna", 1, 1, 1, 0, 0, 40))]
+    assert any("categories" in p for p in plan), plan
