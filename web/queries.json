@@ -9,11 +9,15 @@
   "redundancy_rows": "SELECT hash, size, backup_copies, copies, example_path FROM content WHERE backup_copies < ? ORDER BY backup_copies, size DESC LIMIT ?",
   "redundancy_total": "SELECT COALESCE(SUM(content_count), 0) AS n FROM backup_histogram WHERE backup_copies < ?",
   "policy_rows": "SELECT hash, size, backup_copies, copies, example_path,       backup_sites, backup_kinds, backup_verified_at FROM content WHERE backup_copies < ? OR backup_sites < ? OR backup_kinds < ?    OR (? > 0 AND COALESCE(backup_verified_at, 0) < ?) ORDER BY backup_copies, size DESC LIMIT ?",
+  "category_rows": "SELECT DISTINCT c.hash, c.size, c.backup_copies, c.copies,       c.example_path, c.backup_sites, c.backup_kinds,       c.backup_verified_at  FROM content c JOIN categories k ON k.hash = c.hash WHERE k.category = ?   AND (c.backup_copies < ? OR c.backup_sites < ?        OR c.backup_kinds < ?        OR (? > 0 AND COALESCE(c.backup_verified_at, 0) < ?)) ORDER BY c.backup_copies, c.size DESC LIMIT ?",
+  "category_total": "SELECT COUNT(DISTINCT c.hash) AS n  FROM content c JOIN categories k ON k.hash = c.hash WHERE k.category = ?   AND (c.backup_copies < ? OR c.backup_sites < ?        OR c.backup_kinds < ?        OR (? > 0 AND COALESCE(c.backup_verified_at, 0) < ?))",
   "scoped_rows": "SELECT DISTINCT c.hash, c.size, c.backup_copies, c.copies,       c.example_path, c.backup_sites, c.backup_kinds,       c.backup_verified_at  FROM content c JOIN instances i ON i.hash = c.hash WHERE i.medium_id = ?   AND (c.backup_copies < ? OR c.backup_sites < ?        OR c.backup_kinds < ?        OR (? > 0 AND COALESCE(c.backup_verified_at, 0) < ?)) ORDER BY c.backup_copies, c.size DESC LIMIT ?",
   "scoped_total": "SELECT COUNT(DISTINCT c.hash) AS n  FROM content c JOIN instances i ON i.hash = c.hash WHERE i.medium_id = ?   AND (c.backup_copies < ? OR c.backup_sites < ?        OR c.backup_kinds < ?        OR (? > 0 AND COALESCE(c.backup_verified_at, 0) < ?))",
   "policy_total": "SELECT COUNT(*) AS n FROM content WHERE backup_copies < ? OR backup_sites < ? OR backup_kinds < ?    OR (? > 0 AND COALESCE(backup_verified_at, 0) < ?)",
   "only_on_rows": "SELECT path, size FROM instances WHERE medium_id=? AND only_here=1 ORDER BY size DESC LIMIT ?",
   "only_on_totals": "SELECT only_here_count, only_here_bytes FROM media WHERE medium_id=?",
   "due": "SELECT medium_id, kind, durability, site, verified_at, last_scanned,       file_count, byte_count, sole_backup_count, sole_backup_bytes  FROM media WHERE durability <> 'working' ORDER BY sole_backup_count > 0 DESC,          verified_at IS NULL DESC, verified_at ASC",
+  "categories": "SELECT category, COUNT(*) AS n FROM categories GROUP BY category ORDER BY category",
+  "category_source": "SELECT source_key, imported_at FROM category_source WHERE id=1",
   "newest_scan": "SELECT MAX(last_scanned) AS newest FROM media"
 }

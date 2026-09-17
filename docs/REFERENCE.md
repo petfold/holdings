@@ -170,6 +170,24 @@ Counts distinct nids from `rad node routing --json` minus this node's own.
 **Refuses** when the node is stopped: an empty routing table is not evidence
 of zero seeds.
 
+### `holdings import-categories [listing]` — writes
+
+Materialise OntoDAG categories against placement, so a reader can join the
+two without a lattice. **Prototype**, and opt-in: a catalog only has
+categories if someone imported them.
+
+| flag | meaning |
+|---|---|
+| `--source-key` | what the memberships were composed from, so staleness is detectable |
+
+Reads JSON lines of `{"item": "<hash>", "categories": [...]}`, which `odag`
+produces from its composed view. Full rebuild, not diffing. Categories for
+content this catalog has never seen are skipped and counted, never recorded.
+
+holdings does not compute categories: semantics belong to OntoDAG. See
+[ontodag PROJECTIONS.md §3](https://github.com/petfold/ontodag/blob/main/docs/plans/PROJECTIONS.md),
+amended 2026-09-17 to permit exactly this.
+
 ### `holdings whereis <target>` — read-only
 
 Which media hold this content. `<target>` is a path, a bare filename, or a
@@ -183,6 +201,7 @@ Content below a backup policy.
 |---|---|---|
 | `--min-copies` | 2 | backup copies required |
 | `--on` | — | only content present on this medium — the question before wiping it |
+| `--category` | — | only content in this OntoDAG category (needs `import-categories`) |
 | `--min-sites` | 1 | the *1 offsite* of 3-2-1 |
 | `--min-kinds` | 1 | the *2 media types* of 3-2-1 |
 | `--verified-within` | 0 | require some backup copy to have been read within N days |
@@ -302,6 +321,8 @@ Placement truth. Semantics belong to OntoDAG.
 | `scans` | one row per scan |
 | `catalog_summary` | one row of totals, so `stats` reads no tables |
 | `backup_histogram` | counts by `backup_copies`, so `redundancy`'s total is a few rows |
+| `categories` | human categories composed by OntoDAG, materialised against content — optional |
+| `category_source` | what those memberships were composed from, and when |
 
 Derived columns are a cache over the base tables, recomputed wholesale after
 every write command. `holdings check` reports any disagreement. They are

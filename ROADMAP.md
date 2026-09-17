@@ -56,6 +56,25 @@ Goal: answer "which media hold which files?" from a single stdlib-only script.
 
 ## v0.3 — OntoDAG join live
 
+- [x] **The join, from the reader's side** (DONE 2026-09-17, prototype):
+      `import-categories` materialises composed OntoDAG memberships against
+      placement, and `redundancy --category` answers "which Vienna photos
+      are unbacked?" as an index lookup — 40 rows in 10 ms over a 40,000
+      object catalog.
+
+      This is the shape decided in
+      [ontodag#20](https://github.com/petfold/ontodag/issues/20): compose
+      where both halves are present, materialise the answer, ship no lattice
+      to the reader. It needed no ontodag code — `Session.view()` and the
+      cone query shipped 2026-08-20 — only the §3 amendment (*Derived, never
+      authoritative*) and `odag ingest --source-key`, both merged in
+      petfold/ontodag#21.
+
+      Still a prototype: it publishes the categorisation as well as
+      placement, so it is opt-in; it is a snapshot, so re-categorising means
+      re-importing; and only materialised categories are queryable.
+      Arbitrary lattice traversal in a browser is still BROWSER.md §4–§6.
+
 - [ ] Consume ontodag's overlay view directly instead of emitting a JSONL
       projection for someone else to ingest. The wire format is
       ontodag's `docs/plans/PROJECTIONS.md` §4; `ontodag_ingest.py` is the

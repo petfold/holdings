@@ -237,7 +237,36 @@ availability is the sum of voluntary seeds — so what counts is **seeds other
 than your own**. `rad-seeds` counts them from the node's routing table. A
 repo seeded only by your node is your node, and stops counting as a backup.
 
-## 8. Scripting it
+## 8. Categories, joined to placement
+
+holdings answers *where*; OntoDAG answers *what it is about*. The join is the
+reason both exist — *"which Vienna photos are unbacked?"* — and it happens by
+composing the memberships where both halves are present, then materialising
+them:
+
+```bash
+# on the machine that has both: ask OntoDAG for composed memberships
+odag get vienna --items-only | ... > cats.jsonl    # {"item": "sha256:…", "categories": [...]}
+
+holdings import-categories cats.jsonl --source-key "$(odag inspect --root)"
+holdings redundancy --category vienna --min-copies 1
+```
+
+holdings does not compute categories and never will. It reads a listing, the
+way it reads every other source, and the import is a full rebuild rather than
+a merge — staleness is permitted here, drift is not. Content the catalog has
+never seen is skipped and counted rather than recorded.
+
+`--source-key` records what the memberships were composed from, so a reader
+can tell whether they still describe this catalog. That is the condition
+ontodag's projection contract gained when it stopped requiring derived data
+to stay on the machine that built it.
+
+Cost is proportional to the category, not the catalog: measured at 40 rows in
+10 ms over a 40,000-object catalog. This is a prototype — see
+[ontodag#20](https://github.com/petfold/ontodag/issues/20).
+
+## 9. Scripting it
 
 Every read command takes `--json` and prints one object:
 
@@ -250,7 +279,7 @@ holdings due --json | jq -r '.media[] | select(.overdue) | .medium_id'
 `redundancy`, `only-on`, `due` and `check-swarm` take `--exit-code`, which is
 what makes them usable from a timer.
 
-## 9. Reading the catalog somewhere else
+## 10. Reading the catalog somewhere else
 
 The catalog is a path, so how it travels is not holdings' business. Put it in
 a synced folder and every device carries it. Or publish it read-only and
@@ -272,7 +301,7 @@ python web/serve.py --db ~/catalog.sqlite      # offline, no node, no wallet
 python web/publish.py --feed <owner-hex>/holdings
 ```
 
-## 10. Keeping it honest
+## 11. Keeping it honest
 
 ```bash
 holdings check

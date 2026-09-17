@@ -84,6 +84,12 @@ Face, Radicle), a Swarm root. Where the source can supply a SHA-256,
 placement is exact rather than matched by name and size. See
 [User Guide §7](docs/USER_GUIDE.md#7-media-you-cannot-mount).
 
+Human categories from OntoDAG can be materialised against placement, so
+`redundancy --category vienna` answers *"which Vienna photos are unbacked?"*
+as an index lookup — no lattice shipped to the reader. Prototype; see the
+[User Guide](docs/USER_GUIDE.md#7-media-you-cannot-mount) and
+[ontodag#20](https://github.com/petfold/ontodag/issues/20).
+
 The catalog can also be published read-only and queried from a phone without
 holding it — a lookup fetches tens of kilobytes of a catalog that may be
 hundreds of megabytes — or served offline from a checkout with
@@ -136,7 +142,7 @@ See `ontodag_ingest.py` for an adaptation template.
 * holdings cannot verify a durability class or a site. Those are your
   assertions when you register a medium; what it can do is stop one word
   standing in for five different things.
-* Tests: `pip install -e ".[test]" && pytest` — **241 tests**, stdlib only,
+* Tests: `pip install -e ".[test]" && pytest` — **249 tests**, stdlib only,
   no node and no network; a guard fails if that number drifts from the
   suite. The browser viewer's logic has its own:
   `node --test web/test/view.test.mjs`.
