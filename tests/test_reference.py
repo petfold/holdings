@@ -148,11 +148,12 @@ def test_the_schema_table_lists_every_table(reference):
 
 
 def test_the_version_matches_the_package(reference):
-    import tomllib
-    version = tomllib.loads(
-        (ROOT / "pyproject.toml").read_text())["project"]["version"]
-    assert f"`{version}`" in reference, (
-        f"REFERENCE.md does not say it describes {version}")
+    # Not tomllib: it arrived in 3.11 and this package supports 3.10.
+    m = re.search(r'^version = "([^"]+)"',
+                  (ROOT / "pyproject.toml").read_text(), re.M)
+    assert m, "pyproject.toml has no version"
+    assert f"`{m.group(1)}`" in reference, (
+        f"REFERENCE.md does not say it describes {m.group(1)}")
 
 
 def test_write_commands_are_marked_as_such(cli, reference):
