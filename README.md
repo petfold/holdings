@@ -249,6 +249,51 @@ what rot looks like. And a file that cannot be read is kept and reported
 rather than pruned as deleted, because a failing drive and a tidied-up one
 must not produce the same catalog change.
 
+### Hubs: GitHub, Hugging Face, Radicle
+
+A git remote is a `hosted` medium — the copy survives deleting your working
+tree, but someone else decides how long it stays. What makes it different
+from a directory is what counts as being there:
+
+```bash
+./holdings.py add-medium github --kind other --durability hosted --site github
+./holdings.py import-git github ~/projects/thing
+```
+
+It reads the tree of the **remote ref**, not your `HEAD`. Anything
+uncommitted, unpushed or ignored is not on the hub, and recording it as
+backed up would be wrong for exactly the files you are working on. You get
+told when that gap exists:
+
+```
+WARNING: HEAD is 1 commit(s) ahead of origin/master. Anything only in those
+commits is NOT on the remote and is not recorded here.
+WARNING: 2 uncommitted or untracked path(s) in the working tree.
+```
+
+Placement is **exact**, and costs no network: the local object store already
+holds the bytes, so `import-git` hashes them straight out of it. Measured on
+this repo: 18 files, all by hash, 0.14s.
+
+**git-lfs** pointers resolve to the content they point at — an LFS pointer
+names its object by sha256, the same identity this catalog uses. That
+matters most where it is used most: a Hugging Face model repo is pointers
+almost all the way down, and hashing those would record a few hundred bytes
+of text as if it were the weights.
+
+One consequence worth expecting: if you have not `git lfs pull`ed, your
+working tree holds the *pointer*, so scanning the checkout records the
+pointer — which is correct, and means the model shows as unbacked on your
+laptop while the hub has it. That is the true state of affairs.
+
+**Radicle** works with the same command, being a git remote. But its
+durability is not GitHub's: no custodian who can close your account, and in
+exchange availability is the sum of whoever volunteers to seed you. The
+quantity that ought to count is **seeds other than your own** — a repo
+seeded only by your node is not a second copy — and holdings cannot see
+that today, so it records one `hosted` copy, which is the honest floor
+rather than the true number.
+
 ### Swarm as a medium
 
 Content you have published to Swarm can count as a backup copy. It is a
@@ -450,7 +495,7 @@ See `ontodag_ingest.py` for an adaptation template.
   (`.cache`, `.config`, `.git`, `node_modules`, Syncthing internals, …);
   add your own with `--exclude-file`.
 * Concurrent writes are not supported by design (single-writer model).
-* Tests: `pip install -e ".[test]" && pytest` — **186 tests**, stdlib only, no
+* Tests: `pip install -e ".[test]" && pytest` — **199 tests**, stdlib only, no
   node and no network; a guard fails if that number drifts from the suite.
 * Roadmap: see [ROADMAP.md](ROADMAP.md) — v0.2 through v0.5, and which of the
   limits above are meant to change.

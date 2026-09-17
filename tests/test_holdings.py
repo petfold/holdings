@@ -619,7 +619,7 @@ def test_the_commands_that_write_are_the_ones_that_change_placement():
               if isinstance(a, argparse._SubParsersAction)]
     writers = {n for n, sp in subs.choices.items() if sp.get_default("writes")}
     assert writers == {"add-medium", "scan", "import", "import-restic",
-                       "import-swarm", "check-swarm"}
+                       "import-swarm", "import-git", "check-swarm"}
 
 
 @pytest.mark.parametrize("argv", [
