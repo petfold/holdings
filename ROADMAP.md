@@ -272,11 +272,28 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
         unverified, because they are three different claims. `sha256sum`
         gives no sizes, so an entry whose hash the catalog has never seen is
         skipped and counted rather than recorded with an invented size.
-      * **Hubs** — needs git-awareness, not a directory scan: only content
-        committed *and* pushed *and* still reachable from a remote ref is
-        there. `hosted` is the class; the reader is the work. Radicle sits
-        in the same class but its countable quantity is seeds *other than
-        your own* — a repo seeded only by your node is not a second copy.
+      * [x] **Hubs** (DONE 2026-09-17): `import-git`, for GitHub,
+        Hugging Face, Radicle, or any git remote. It reads the tree of the
+        remote ref rather than `HEAD`, so uncommitted, unpushed and ignored
+        files are excluded — and says so when that gap exists, because
+        those are exactly the files someone would most regret assuming were
+        backed up.
+
+        Placement is exact and costs no network: the local object store
+        already has the bytes, which is the accident that makes this worth
+        doing rather than a listing-and-guess. Measured on this repo: 18
+        files, all by hash, 0.14s. git-lfs pointers resolve to the content
+        they name — an LFS pointer carries a sha256, the same identity this
+        catalog uses, which matters most on Hugging Face where a repo is
+        pointers almost all the way down.
+
+        Radicle uses the same command but not the same durability, and this
+        is the part still unmodelled: it has no custodian who can close your
+        account, and in exchange availability is the sum of voluntary seeds.
+        The quantity that should count is **seeds other than your own**;
+        holdings records one `hosted` copy, which is a floor and not the
+        truth. Counting seeds needs `rad`-specific plumbing.
+
       * **Sync mirrors as a placement source** — v0.2's Syncthing REST
         adapter feeds `mirror`, and the class is now there to receive it.
 

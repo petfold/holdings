@@ -1395,6 +1395,147 @@ LISTING_FORMATS = {
 }
 
 
+# --------------------------------------------------------------------------
+# Git remotes as media
+# --------------------------------------------------------------------------
+
+# GitHub, Hugging Face, Radicle, a bare repo on a server: for holdings they
+# are one kind of medium, and the thing that makes them different from a
+# directory is what counts as being there. A working tree holds files that
+# the remote does not: anything uncommitted, anything unpushed, anything
+# ignored. Scanning the checkout would record every one of them as backed
+# up, which is precisely wrong for the files someone is working on.
+#
+# So the reader walks the tree of the *remote* ref. And it can be exact
+# without touching the network, because the local object store already has
+# the bytes -- which is the happy accident that makes this worth doing.
+
+LFS_MAGIC = b"version https://git-lfs.github.com/spec/v1"
+
+
+def git(repo: str, *args: str, binary: bool = False):
+    import subprocess
+    out = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    if out.returncode != 0:
+        sys.exit(f"git {' '.join(args)}: "
+                 f"{out.stderr.decode(errors='replace').strip()}")
+    return out.stdout if binary else out.stdout.decode(errors="replace")
+
+
+def git_remote_ref(repo: str, ref: str | None, remote: str) -> str:
+    """Which commit the hub actually has.
+
+    Deliberately not HEAD. HEAD is what you have; the remote ref is what
+    they have, and the gap between them is unpushed work -- exactly the
+    content someone would most regret assuming was backed up.
+    """
+    if ref:
+        return ref
+    import subprocess
+    for candidate in ("@{u}", f"{remote}/HEAD"):
+        out = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--abbrev-ref",
+             "--symbolic-full-name", candidate], capture_output=True)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.decode().strip()
+    sys.exit(f"cannot tell what '{remote}' has: no upstream for this branch"
+             f" and no {remote}/HEAD. Pass --ref (e.g. --ref {remote}/main),"
+             f" and `git fetch` first if it is stale.")
+
+
+def parse_lfs_pointer(blob: bytes):
+    """An LFS pointer names its content by sha256 -- the same identity this
+    catalog uses, handed over for free.
+
+    Which matters most where it is most used: a Hugging Face model repo is
+    pointers almost all the way down, and hashing those pointers would
+    record a few hundred bytes of text as if it were the weights.
+    """
+    if not blob.startswith(LFS_MAGIC):
+        return None
+    oid = size = None
+    for line in blob.decode(errors="replace").splitlines():
+        if line.startswith("oid sha256:"):
+            oid = line.split(":", 1)[1].strip()
+        elif line.startswith("size "):
+            try:
+                size = int(line.split(None, 1)[1])
+            except (ValueError, IndexError):
+                return None
+    return {"hash": oid, "size": size} if oid and size is not None else None
+
+
+def git_listing(repo: str, ref: str):
+    """Every file the remote ref holds, with its exact sha256.
+
+    The bytes come from the local object store, so this costs no network
+    and is exact -- `git cat-file --batch` streams them in one pass rather
+    than a subprocess per blob.
+    """
+    import subprocess
+
+    blobs = []
+    for line in git(repo, "ls-tree", "-r", "-l", ref).splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if len(parts) != 4:
+            continue
+        mode, kind, oid, size = parts
+        # Submodules are commits, not content; symlinks are skipped here for
+        # the same reason `scan` skips them.
+        if kind != "blob" or mode == "120000":
+            continue
+        blobs.append((oid, int(size) if size.isdigit() else 0, path))
+    if not blobs:
+        return
+
+    proc = subprocess.Popen(["git", "-C", repo, "cat-file", "--batch"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    try:
+        for oid, size, path in blobs:
+            proc.stdin.write(f"{oid}\n".encode())
+            proc.stdin.flush()
+            header = proc.stdout.readline().split()
+            if len(header) < 3:
+                continue
+            body = proc.stdout.read(int(header[2]))
+            proc.stdout.read(1)                      # the trailing newline
+            lfs = parse_lfs_pointer(body)
+            if lfs:
+                yield {"path": path, "size": lfs["size"],
+                       "hash": lfs["hash"], "ref": f"lfs:{lfs['hash'][:12]}"}
+            else:
+                yield {"path": path, "size": size,
+                       "hash": hashlib.sha256(body).hexdigest(),
+                       "ref": f"git:{oid[:12]}"}
+    finally:
+        proc.stdin.close()
+        proc.wait()
+
+
+def cmd_import_git(conn, args):
+    """Record what a git remote holds: GitHub, Hugging Face, Radicle."""
+    require_medium(conn, args.medium_id, "--durability hosted")
+    ref = git_remote_ref(args.repo, args.ref, args.remote)
+    stats = ingest_listing(conn, args.medium_id,
+                           git_listing(args.repo, ref), "git")
+    print(f"from {ref}:")
+    report_listing(args.medium_id, stats)
+
+    # The gap that matters: what you have and they do not.
+    ahead = git(args.repo, "rev-list", "--count", f"{ref}..HEAD").strip()
+    if ahead and ahead != "0":
+        print(f"WARNING: HEAD is {ahead} commit(s) ahead of {ref}."
+              f" Anything only in those commits is NOT on the remote and is"
+              f" not recorded here.", file=sys.stderr)
+    dirty = git(args.repo, "status", "--porcelain").strip()
+    if dirty:
+        n = len(dirty.splitlines())
+        print(f"WARNING: {n} uncommitted or untracked path(s) in the working"
+              f" tree. A hub holds what was pushed, never what is merely"
+              f" present.", file=sys.stderr)
+
+
 def ingest_listing(conn, medium_id: str, entries, source: str) -> dict:
     """Record a listing as placement on `medium_id`.
 
@@ -1895,6 +2036,16 @@ def build_parser():
                         " rclone: `rclone lsjson -R [--hash]`;"
                         " sha256sum: `sha256sum` output (exact, no sizes)")
     s.set_defaults(func=cmd_import, writes=True)
+
+    s = sub.add_parser("import-git",
+                       help="record what a git remote holds (GitHub,"
+                            " Hugging Face, Radicle)")
+    s.add_argument("medium_id")
+    s.add_argument("repo", help="path to a local clone")
+    s.add_argument("--ref", help="the remote ref to read"
+                                 " (default: this branch's upstream)")
+    s.add_argument("--remote", default="origin")
+    s.set_defaults(func=cmd_import_git, writes=True)
 
     s = sub.add_parser("import-restic",
                        help="ingest `restic ls --json` output ('-' = stdin)")
