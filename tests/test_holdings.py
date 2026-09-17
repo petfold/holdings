@@ -2047,3 +2047,111 @@ def test_the_probe_needs_no_optional_extra(monkeypatch):
     no_swarmlite_import(monkeypatch, "fsspec")
     assert holdings.swarm_probe("http://127.0.0.1:1", "ref", False, 0.2) \
         is False        # unreachable, but it got as far as trying
+
+
+# ------------------------------------------- "can I reformat this laptop?"
+
+@pytest.fixture
+def before_a_reformat(run, tmp_path, capsys):
+    """A laptop, a real backup drive, and a sync mirror — the arrangement
+    that makes the naive check wrong."""
+    laptop, drive, mirror = (tmp_path / "laptop", tmp_path / "drive",
+                             tmp_path / "mirror")
+    write(laptop / "holiday.jpg", "photo")
+    write(drive / "holiday.jpg", "photo")          # a real backup
+    write(laptop / "thesis.pdf", "thesis!")
+    write(mirror / "thesis.pdf", "thesis!")        # only in Dropbox
+    write(laptop / "notes.txt", "scratch!")        # nowhere else
+    run("add-medium", "laptop", "--kind", "laptop")
+    run("add-medium", "drive", "--kind", "drive", "--durability",
+        "independent")
+    run("add-medium", "dropbox", "--kind", "cloud", "--durability", "mirror")
+    run("scan", "laptop", str(laptop))
+    run("scan", "drive", str(drive))
+    run("scan", "dropbox", str(mirror))
+    capsys.readouterr()
+    return run
+
+
+def test_only_on_alone_would_clear_a_laptop_that_is_not_safe(
+        before_a_reformat, capsys):
+    """Pinning the trap. `only-on` asks "does anything else hold this?", and
+    a sync mirror answers yes — while being exactly the copy that does not
+    survive. thesis.pdf has no backup and `only-on` stays silent about it."""
+    before_a_reformat("only-on", "laptop")
+    out = capsys.readouterr().out
+    assert "notes.txt" in out
+    assert "thesis.pdf" not in out, "only-on cannot answer the wipe question"
+
+
+def test_scoped_redundancy_catches_what_only_on_misses(before_a_reformat,
+                                                       capsys):
+    before_a_reformat("redundancy", "--on", "laptop", "--min-copies", "1")
+    out = capsys.readouterr().out
+    assert "notes.txt" in out and "thesis.pdf" in out
+    assert "holiday.jpg" not in out, "the genuinely backed-up file is quiet"
+
+
+def test_the_reformat_gate(before_a_reformat, tmp_path, capsys):
+    run = before_a_reformat
+    with pytest.raises(SystemExit) as e:
+        run("redundancy", "--on", "laptop", "--min-copies", "1",
+            "--exit-code")
+    assert e.value.code == 1
+
+    drive = tmp_path / "drive"                    # back the stragglers up
+    write(drive / "thesis.pdf", "thesis!")
+    write(drive / "notes.txt", "scratch!")
+    run("scan", "drive", str(drive))
+    capsys.readouterr()
+    run("redundancy", "--on", "laptop", "--min-copies", "1", "--exit-code")
+    assert "everything on 'laptop'" in capsys.readouterr().out
+
+
+def test_scoping_ignores_content_that_is_not_on_that_medium(
+        before_a_reformat, run, tmp_path, capsys):
+    """An unbacked file elsewhere must not block reformatting the laptop."""
+    other = tmp_path / "other"
+    write(other / "unrelated.bin", "unbacked")
+    run("add-medium", "usb", "--kind", "drive")
+    run("scan", "usb", str(other))
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit):               # catalog-wide: still bad
+        run("redundancy", "--min-copies", "1", "--exit-code")
+    capsys.readouterr()
+    with pytest.raises(SystemExit):               # laptop: bad for its own
+        run("redundancy", "--on", "laptop", "--min-copies", "1",
+            "--exit-code")
+    out = capsys.readouterr().out
+    assert "unrelated.bin" not in out
+
+
+def test_scoping_does_not_double_count_a_file_held_twice(run, db, tmp_path,
+                                                         capsys):
+    """One content object at two paths on the same medium is one object."""
+    laptop = tmp_path / "laptop"
+    write(laptop / "a.txt", "same")
+    write(laptop / "copy-of-a.txt", "same")
+    run("add-medium", "laptop", "--kind", "laptop")
+    run("scan", "laptop", str(laptop))
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        run("redundancy", "--on", "laptop", "--min-copies", "1", "--json",
+            "--exit-code")
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["below"] == 1 and doc["on"] == "laptop"
+
+
+def test_scoping_to_an_unknown_medium_is_an_error(before_a_reformat):
+    with pytest.raises(SystemExit) as e:
+        before_a_reformat("redundancy", "--on", "nosuch")
+    assert "unknown medium" in str(e.value)
+
+
+def test_a_plain_scoped_report_does_not_claim_unset_thresholds(
+        before_a_reformat, capsys):
+    """--on must not imply site and kind constraints it is not applying."""
+    before_a_reformat("redundancy", "--on", "laptop", "--min-copies", "1")
+    out = capsys.readouterr().out
+    assert "site" not in out and "SITE" not in out

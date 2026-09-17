@@ -155,11 +155,32 @@ folder structurally cannot do, because Syncthing needs overlapping uptime.
       all four of which previously failed to finish in 8 minutes.
       Cost: the derived columns and their indexes grew the catalog from
       113 MB to 157 MB (+39%), and refresh adds a few seconds to a scan.
-- [ ] **`diff A B` is the one report still proportional to its input.** It
-      asks "does B hold this too?" once per file on A, which no
-      precomputation removes. Acceptable locally; expensive over a network.
-      If it ever matters, it wants a per-pair summary rather than a better
-      index.
+- [x] **"Is everything on this medium backed up?"** (DONE 2026-09-17):
+      `redundancy --on MEDIUM`. Raised by the reformat case — and it turned
+      out `diff` was the wrong tool for it and `only-on` was quietly the
+      wrong answer.
+
+      `diff A B` asks what one *other* medium happens to lack, so it flags
+      files that are safely backed up somewhere else and its answer depends
+      on which medium you compared against. `only-on` asks whether anything
+      else holds the content — and a sync mirror answers yes while being
+      exactly the copy that does not survive. Measured: a laptop with a file
+      only in Dropbox is cleared by `only-on` and has no backup at all.
+      Scoping the backup-copy question to one medium is the question that
+      was actually being asked.
+
+      Proportional to the medium, like `diff`, because it walks its rows.
+      Fine for a decision made sitting in front of the thing; it would want
+      the `only_here` flag treatment if it ever had to be fast over a
+      network.
+
+- [ ] **`diff A B` is still proportional to its input.** It asks "does B
+      hold this too?" once per file on A. The *totals* could be precomputed
+      — media are few, so a per-pair summary is small — but the row listing
+      would need a flag per instance per pair, which is absurd. Left alone
+      because the question it answers well (what does B lack that A has?) is
+      rarely urgent, and the question people reach for it with is now
+      `redundancy --on`.
 - [x] **Warn on a stale published catalog** (DONE 2026-09-16). A synced
       folder refreshes itself; a pin never does and a feed only moves when
       someone republishes, so a reader can be looking at months-old
